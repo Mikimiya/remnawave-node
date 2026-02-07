@@ -1,6 +1,6 @@
 # Remnawave Node Go
 
-Go implementation of [remnawave/node](https://github.com/remnawave/node). Single binary, single port, embedded Xray-core, zero dependencies.
+Go implementation of [remnawave/node](https://github.com/remnawave/node). Single binary, single port, embedded Xray-core, zero dependencies.It was created using Claude Opus 4.5.
 
 ## Quick Start
 
