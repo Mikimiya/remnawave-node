@@ -32,7 +32,7 @@ func Load() (*Config, error) {
 	cfg := &Config{}
 
 	// NODE_PORT (required)
-	portStr := getEnv("NODE_PORT", "3000")
+	portStr := getEnv("NODE_PORT", "2222")
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid NODE_PORT: %w", err)

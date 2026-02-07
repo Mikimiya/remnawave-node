@@ -5,7 +5,7 @@
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `SECRET_KEY` | ✅ | - | Base64 encoded JSON from Remnawave Panel |
-| `NODE_PORT` | ❌ | 3000 | Main API server port |
+| `NODE_PORT` | ❌ | 2222 | Main API server port |
 | `DISABLE_HASHED_SET_CHECK` | ❌ | false | Disable config change detection |
 
 ## SECRET_KEY Structure
@@ -27,7 +27,7 @@ You get this from the Remnawave Panel when adding a new node.
 
 | Port | Description |
 |------|-------------|
-| `NODE_PORT` (default 3000) | Main API (mTLS) - only port needed |
+| `NODE_PORT` (default 2222) | Main API (mTLS) - only port needed |
 
 Unlike the Node.js version, no additional ports are required:
 - ❌ Port 61000 (Xray gRPC) - Not needed, Xray is embedded
@@ -39,8 +39,8 @@ Unlike the Node.js version, no additional ports are required:
 ```bash
 docker run -d \
   -e SECRET_KEY="your_base64_key" \
-  -e NODE_PORT="3000" \
-  -p 3000:3000 \
+  -e NODE_PORT="2222" \
+  -p 2222:2222 \
   ghcr.io/Mikimiya/remnawave-node:latest
 ```
 

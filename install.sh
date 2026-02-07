@@ -297,8 +297,8 @@ EOF
 # Node payload (base64 encoded, from panel) - REQUIRED
 # SECRET_KEY=
 
-# API Port (default: 3000)
-# NODE_PORT=3000
+# API Port (default: 2222)
+# NODE_PORT=2222
 
 # Log level: debug, info, warn, error
 # LOG_LEVEL=info

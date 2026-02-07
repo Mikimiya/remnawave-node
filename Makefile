@@ -180,8 +180,8 @@ docker-build:
 docker-run: docker-build
 	docker run --rm -it \
 		-e SECRET_KEY=$${SECRET_KEY} \
-		-e NODE_PORT=3000 \
-		-p 3000:3000 \
+		-e NODE_PORT=2222 \
+		-p 2222:2222 \
 		$(BINARY_NAME):$(VERSION)
 
 # Show help

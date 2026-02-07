@@ -17,7 +17,7 @@ Other commands: `update` | `update-geo` | `uninstall` — append to the command 
 ```bash
 docker run -d --name remnawave-node --restart always \
   -e SECRET_KEY="<YOUR_SECRET_KEY>" \
-  -p 3000:3000 \
+  -p 2222:2222 \
   ghcr.io/Mikimiya/remnawave-node:latest
 ```
 
@@ -26,7 +26,7 @@ docker run -d --name remnawave-node --restart always \
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `SECRET_KEY` | ✅ | - | Node key from Remnawave panel |
-| `NODE_PORT` | No | `3000` | API port |
+| `NODE_PORT` | No | `2222` | API port |
 | `PORT_MAP` | No | - | NAT port mapping. Format: `443:10000,80:10001` |
 
 ## Post-install

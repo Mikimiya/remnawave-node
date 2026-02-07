@@ -27,9 +27,9 @@ COPY --from=builder /remnawave-node /usr/local/bin/remnawave-node
 COPY --from=builder /app/geoip.dat /usr/local/bin/geoip.dat
 COPY --from=builder /app/geosite.dat /usr/local/bin/geosite.dat
 
-ENV NODE_PORT=3000
+ENV NODE_PORT=2222
 ENV XRAY_LOCATION_ASSET=/usr/local/bin/
 
-EXPOSE 3000
+EXPOSE 2222
 
 CMD ["/usr/local/bin/remnawave-node"]
