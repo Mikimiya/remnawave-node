@@ -1,0 +1,416 @@
+// ============================================================
+// Xray-core 完整服务端配置示例
+// 功能：VLESS+REALITY / VLESS+WS+TLS / VMess+WS+TLS / Trojan+TLS
+// 包含：DNS 分流、路由规则、流量统计、API 管理
+// ============================================================
+{
+  // ==================== 日志配置 ====================
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning",
+    "dnsLog": false
+  },
+
+  // ==================== API 配置 ====================
+  // 用于远程管理和流量统计查询
+  "api": {
+    "tag": "api",
+    "listen": "127.0.0.1:10085",
+    "services": [
+      "HandlerService",
+      "StatsService",
+      "LoggerService"
+    ]
+  },
+
+  // ==================== 统计配置 ====================
+  "stats": {},
+
+  // ==================== 策略配置 ====================
+  "policy": {
+    "levels": {
+      "0": {
+        "handshake": 4,
+        "connIdle": 300,
+        "uplinkOnly": 2,
+        "downlinkOnly": 5,
+        "statsUserUplink": true,
+        "statsUserDownlink": true,
+        "statsUserOnline": true,
+        "bufferSize": 4
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
+
+  // ==================== DNS 配置 ====================
+  // DNS 分流：国内域名走国内 DNS，国外域名走国外 DNS
+  "dns": {
+    "servers": [
+      // 国外 DNS（默认）
+      {
+        "address": "https://1.1.1.1/dns-query",
+        "domains": [
+          "geosite:geolocation-!cn",
+          "geosite:google",
+          "geosite:facebook",
+          "geosite:twitter",
+          "geosite:telegram",
+          "geosite:youtube",
+          "geosite:netflix"
+        ],
+        "skipFallback": true,
+        "tag": "dns-remote"
+      },
+      // 国内 DNS
+      {
+        "address": "https://223.5.5.5/dns-query",
+        "domains": [
+          "geosite:cn",
+          "geosite:geolocation-cn",
+          "geosite:apple-cn",
+          "geosite:microsoft@cn",
+          "geosite:category-games@cn"
+        ],
+        "expectedIPs": ["geoip:cn"],
+        "skipFallback": true,
+        "tag": "dns-direct"
+      },
+      // 回退 DNS
+      {
+        "address": "localhost",
+        "skipFallback": false,
+        "tag": "dns-local"
+      }
+    ],
+    "hosts": {
+      // 广告域名拦截
+      "geosite:category-ads-all": "127.0.0.1",
+      // 自定义域名解析
+      "domain:your-domain.com": "1.2.3.4"
+    },
+    "queryStrategy": "UseIP",
+    "disableCache": false,
+    "disableFallback": false,
+    "disableFallbackIfMatch": true,
+    "tag": "dns-inbound"
+  },
+
+  // ==================== 路由配置 ====================
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      // ----- API 路由 -----
+      {
+        "ruleTag": "api-rule",
+        "inboundTag": ["api"],
+        "outboundTag": "api"
+      },
+      // ----- DNS 路由 -----
+      {
+        "ruleTag": "dns-rule",
+        "inboundTag": ["dns-inbound"],
+        "outboundTag": "dns-out"
+      },
+      {
+        "ruleTag": "dns-remote-rule",
+        "inboundTag": ["dns-remote"],
+        "outboundTag": "proxy"
+      },
+      {
+        "ruleTag": "dns-direct-rule",
+        "inboundTag": ["dns-direct"],
+        "outboundTag": "direct"
+      },
+      // ----- 拦截规则 -----
+      // 拦截广告域名
+      {
+        "ruleTag": "block-ads",
+        "domain": [
+          "geosite:category-ads-all"
+        ],
+        "outboundTag": "block"
+      },
+      // 拦截 BitTorrent 协议
+      {
+        "ruleTag": "block-bt",
+        "protocol": ["bittorrent"],
+        "outboundTag": "block"
+      },
+      // ----- 直连规则 -----
+      // 中国大陆域名直连
+      {
+        "ruleTag": "direct-cn-domain",
+        "domain": [
+          "geosite:cn",
+          "geosite:geolocation-cn",
+          "geosite:apple-cn",
+          "geosite:microsoft@cn",
+          "geosite:category-games@cn",
+          "geosite:private"
+        ],
+        "outboundTag": "direct"
+      },
+      // 中国大陆 IP 直连
+      {
+        "ruleTag": "direct-cn-ip",
+        "ip": [
+          "geoip:cn",
+          "geoip:private",
+          "223.5.5.5",
+          "119.29.29.29",
+          "180.76.76.76"
+        ],
+        "outboundTag": "direct"
+      },
+      // 内网地址直连
+      {
+        "ruleTag": "direct-lan",
+        "ip": [
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "::1/128",
+          "fc00::/7"
+        ],
+        "outboundTag": "direct"
+      }
+      // ----- 未匹配流量默认走第一个出站 -----
+    ]
+  },
+
+  // ==================== 入站配置 ====================
+  "inbounds": [
+    // ----- 1. VLESS + REALITY (推荐，主力协议) -----
+    {
+      "tag": "vless-reality",
+      "protocol": "vless",
+      "port": 443,
+      "listen": "0.0.0.0",
+      "settings": {
+        "clients": [
+          {
+            "id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            "flow": "xtls-rprx-vision",
+            "level": 0,
+            "email": "user1@reality"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.microsoft.com",
+            "microsoft.com"
+          ],
+          "privateKey": "YOUR_X25519_PRIVATE_KEY",
+          "shortIds": [
+            "",
+            "0123456789abcdef",
+            "abcd",
+            "01234567"
+          ],
+          "maxTimeDiff": 0
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": false
+      }
+    },
+
+    // ----- 2. VLESS + WebSocket + TLS (CDN 中转) -----
+    {
+      "tag": "vless-ws",
+      "protocol": "vless",
+      "port": 8443,
+      "listen": "127.0.0.1",
+      "settings": {
+        "clients": [
+          {
+            "id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            "level": 0,
+            "email": "user1@ws"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/your-secret-ws-path",
+          "headers": {}
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+
+    // ----- 3. VMess + WebSocket + TLS (兼容旧客户端) -----
+    {
+      "tag": "vmess-ws",
+      "protocol": "vmess",
+      "port": 8444,
+      "listen": "127.0.0.1",
+      "settings": {
+        "clients": [
+          {
+            "id": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
+            "security": "auto",
+            "level": 0,
+            "email": "user1@vmess"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/your-vmess-ws-path",
+          "headers": {}
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+
+    // ----- 4. Trojan + TLS -----
+    {
+      "tag": "trojan-tls",
+      "protocol": "trojan",
+      "port": 8445,
+      "listen": "127.0.0.1",
+      "settings": {
+        "clients": [
+          {
+            "password": "your-trojan-password",
+            "level": 0,
+            "email": "user1@trojan"
+          }
+        ],
+        "fallbacks": [
+          {
+            "dest": "80"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "your-domain.com",
+          "certificates": [
+            {
+              "certificateFile": "/etc/ssl/certs/your-domain.com/fullchain.pem",
+              "keyFile": "/etc/ssl/certs/your-domain.com/privkey.pem"
+            }
+          ],
+          "alpn": ["h2", "http/1.1"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+
+    // ----- 5. Shadowsocks 2022 -----
+    {
+      "tag": "ss-2022",
+      "protocol": "shadowsocks",
+      "port": 8388,
+      "listen": "0.0.0.0",
+      "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "YOUR_BASE64_KEY_HERE",
+        "network": "tcp,udp"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+
+    // ----- 6. SOCKS5 入站 (本地代理用，如在 VPS 上不需要可删除) -----
+    {
+      "tag": "socks-in",
+      "protocol": "socks",
+      "port": 10808,
+      "listen": "127.0.0.1",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+
+    // ----- 7. HTTP 入站 (本地代理用) -----
+    {
+      "tag": "http-in",
+      "protocol": "http",
+      "port": 10809,
+      "listen": "127.0.0.1",
+      "settings": {
+        "allowTransparent": false
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+
+  // ==================== 出站配置 ====================
+  "outbounds": [
+    // ----- 默认出站：直连 -----
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "AsIs"
+      }
+    },
+
+    // ----- 黑洞：拦截流量 -----
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {
+        "response": {
+          "type": "http"
+        }
+      }
+    },
+
+    // ----- DNS 出站 -----
+    {
+      "tag": "dns-out",
+      "protocol": "dns",
+      "settings": {
+        "nonIPQuery": "drop"
+      }
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "ruleTag": "block-bt",
+        "protocol": ["bittorrent"],
+        "outboundTag": "BLOCK"
+      },
+      {
+        "ruleTag": "block-ads",
+        "domain": ["geosite:category-ads-all"],
+        "outboundTag": "BLOCK"
+      }, 
+      {
+        "ruleTag": "direct-common-ports",
+        "port": "22,23,3306,3389,5432,5900,6379",
+        "outboundTag": "direct"
+      },
+      {
+        "ruleTag": "direct-cn-domain",
+        "domain": ["geosite:cn", "geosite:geolocation-cn"],
+        "outboundTag": "direct"
+      },
+      {
+        "ruleTag": "direct-cn-ip",
+        "ip": ["geoip:cn"],
+        "outboundTag": "direct"
+      },
+      {
+        "ruleTag": "direct-private-ip",
+        "ip": ["geoip:private"],
+        "outboundTag": "direct"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "VLESS-TCP-REALITY",
+      "protocol": "vless",
+      "port": 9527,
+      "listen": "0.0.0.0",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": ["www.microsoft.com", "microsoft.com"],
+          "privateKey": "AUS4UV2Hx2bvdHwc1vDAOSBQU_IH0vHmvMbjFKa4oD8",
+          "shortIds": ["", "0123456789abcdef"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": false
+      }
+    },
+    {
+      "tag": "SS-2022",
+      "protocol": "shadowsocks",
+      "port": 8388,
+      "listen": "0.0.0.0",
+      "settings": {
+        "method": "chacha20-ietf-poly1305",
+        "password": "RYeD+935E8WyHrwhTykjvvCaLMplI9hqmTpIEh7sfRc=",
+        "network": "tcp,udp",
+        "clients": []
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"],
+        "routeOnly": false
+      }
+    },
+    {
+      "tag": "SOCKS-IN",
+      "protocol": "socks",
+      "port": 10808,
+      "listen": "127.0.0.1",
+      "settings": {
+        "auth": "password",
+        "accounts": [
+          {
+            "user": "sss",
+            "pass": "ExKqfFsZKPDuIe2Dux39TsaKf7gpZCQLm6SjZsCTeA4="
+          }
+        ],
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "AsIs"
+      }
+    },
+    {
+      "tag": "BLOCK",
+      "protocol": "blackhole",
+      "settings": {
+        "response": {
+          "type": "http"
+        }
+      }
+    }
+  ]
+}
