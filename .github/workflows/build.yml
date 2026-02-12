@@ -46,26 +46,59 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            use_container: true
           - goos: linux
             goarch: arm64
+            use_container: true
           - goos: linux
             goarch: arm
+            use_container: true
           - goos: darwin
             goarch: amd64
+            use_container: false
           - goos: darwin
             goarch: arm64
+            use_container: false
           - goos: windows
             goarch: amd64
+            use_container: false
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
+        if: ${{ !matrix.use_container }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Build
+      - name: Set up QEMU
+        if: ${{ matrix.use_container && matrix.goarch != 'amd64' }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build (Linux - Docker container for glibc compatibility)
+        if: ${{ matrix.use_container }}
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          OUTPUT_NAME=${{ env.BINARY_NAME }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          
+          mkdir -p dist
+          
+          # Use Debian bullseye (glibc 2.31) for maximum compatibility
+          docker run --rm \
+            --platform linux/${{ matrix.goarch }} \
+            -v "$PWD":/src \
+            -w /src \
+            -e GOOS=${{ matrix.goos }} \
+            -e GOARCH=${{ matrix.goarch }} \
+            -e CGO_ENABLED=0 \
+            golang:${{ env.GO_VERSION }}-bullseye \
+            go build -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
+              -o dist/${OUTPUT_NAME} ./cmd/node
+
+      - name: Build (macOS/Windows - native)
+        if: ${{ !matrix.use_container }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -77,7 +110,7 @@ jobs:
             OUTPUT_NAME="${OUTPUT_NAME}.exe"
           fi
           
-          go build -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
+          CGO_ENABLED=0 go build -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
             -o dist/${OUTPUT_NAME} ./cmd/node
 
       - name: Upload artifact
