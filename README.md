@@ -7,10 +7,18 @@ Go implementation of [remnawave/node](https://github.com/remnawave/node). Single
 ### Script Install
 
 ```bash
+# Install
 bash <(curl -fsSL https://raw.githubusercontent.com/Mikimiya/remnawave-node/main/install.sh)
-```
 
-Other commands: `update` | `update-geo` | `uninstall` — append to the command above.
+# Update
+bash <(curl -fsSL https://raw.githubusercontent.com/Mikimiya/remnawave-node/main/install.sh) update
+
+# Update geo files only
+bash <(curl -fsSL https://raw.githubusercontent.com/Mikimiya/remnawave-node/main/install.sh) update-geo
+
+# Uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/Mikimiya/remnawave-node/main/install.sh) uninstall
+```
 
 ### Docker
 
