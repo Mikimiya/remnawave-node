@@ -91,23 +91,6 @@ type XrayConfigData struct {
 	Policy    interface{}   `json:"policy,omitempty"`
 }
 
-// Default policy configuration (matches Node.js XRAY_DEFAULT_POLICY_MODEL)
-var defaultPolicyConfig = map[string]interface{}{
-	"levels": map[string]interface{}{
-		"0": map[string]interface{}{
-			"statsUserUplink":   true,
-			"statsUserDownlink": true,
-			"statsUserOnline":   true,
-		},
-	},
-	"system": map[string]interface{}{
-		"statsInboundDownlink":  true,
-		"statsInboundUplink":    true,
-		"statsOutboundDownlink": true,
-		"statsOutboundUplink":   true,
-	},
-}
-
 // generateApiConfig adds Stats and Policy configurations to the Xray config
 // Note: We don't need API/gRPC config since we're using embedded Xray-core
 func generateApiConfig(config map[string]interface{}) map[string]interface{} {
@@ -121,22 +104,82 @@ func generateApiConfig(config map[string]interface{}) map[string]interface{} {
 	// Add stats configuration (empty object)
 	result["stats"] = map[string]interface{}{}
 
-	// Build and add policy configuration (required for user stats)
-	result["policy"] = defaultPolicyConfig
+	// Build policy by merging user config with required stats settings
+	result["policy"] = buildPolicyConfig(config)
 
-	// Only enable debug logging if NODE_ENV is development
+	// Preserve user's log config if provided, otherwise use defaults
 	logLevel := "warning"
 	if os.Getenv("NODE_ENV") == "development" {
 		logLevel = "debug"
 	}
 
-	result["log"] = map[string]interface{}{
-		"loglevel": logLevel,
-		"access":   "",
-		"error":    "",
+	if existingLog, ok := config["log"].(map[string]interface{}); ok {
+		// User provided log config, preserve it
+		// Only override loglevel if not set or if NODE_ENV=development
+		if _, hasLevel := existingLog["loglevel"]; !hasLevel {
+			existingLog["loglevel"] = logLevel
+		}
+		if os.Getenv("NODE_ENV") == "development" {
+			existingLog["loglevel"] = "debug"
+		}
+		result["log"] = existingLog
+	} else {
+		// No user config, use defaults (no file logging)
+		result["log"] = map[string]interface{}{
+			"loglevel": logLevel,
+			"access":   "",
+			"error":    "",
+		}
 	}
 
 	return result
+}
+
+// buildPolicyConfig merges user's policy config with required stats settings
+// This matches remnawave/node behavior: preserve user settings but force stats fields
+func buildPolicyConfig(config map[string]interface{}) map[string]interface{} {
+	// Start with default system policy (required for stats)
+	builtPolicy := map[string]interface{}{
+		"levels": map[string]interface{}{
+			"0": map[string]interface{}{
+				"statsUserUplink":   true,
+				"statsUserDownlink": true,
+				"statsUserOnline":   true,
+			},
+		},
+		"system": map[string]interface{}{
+			"statsInboundDownlink":  true,
+			"statsInboundUplink":    true,
+			"statsOutboundDownlink": true,
+			"statsOutboundUplink":   true,
+		},
+	}
+
+	// If user provided policy config, merge it
+	if userPolicy, ok := config["policy"].(map[string]interface{}); ok {
+		// Merge user's level 0 settings (but keep stats fields forced)
+		if userLevels, ok := userPolicy["levels"].(map[string]interface{}); ok {
+			if userLevel0, ok := userLevels["0"].(map[string]interface{}); ok {
+				builtLevel0 := builtPolicy["levels"].(map[string]interface{})["0"].(map[string]interface{})
+				// Copy user settings first
+				for k, v := range userLevel0 {
+					// Don't override stats fields
+					if k != "statsUserUplink" && k != "statsUserDownlink" && k != "statsUserOnline" {
+						builtLevel0[k] = v
+					}
+				}
+			}
+			// Copy other levels as-is
+			builtLevels := builtPolicy["levels"].(map[string]interface{})
+			for levelKey, levelVal := range userLevels {
+				if levelKey != "0" {
+					builtLevels[levelKey] = levelVal
+				}
+			}
+		}
+	}
+
+	return builtPolicy
 }
 
 // StartRequestInternals represents the internals part of start request (Node.js format)
