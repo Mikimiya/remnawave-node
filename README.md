@@ -20,6 +20,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Mikimiya/remnawave-node/main
 bash <(curl -fsSL https://raw.githubusercontent.com/Mikimiya/remnawave-node/main/install.sh) uninstall
 ```
 
+### Config Directories
+
+| Path | Description |
+|------|-------------|
+| `/etc/remnawave-node/env` | Environment configuration file |
+| `/var/lib/remnawave-node/` | Data directory |
+| `/usr/local/bin/remnawave-node` | Binary |
+| `/usr/local/bin/remnawave-node-config` | Config helper script |
+
 ### Docker
 
 ```bash
