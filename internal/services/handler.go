@@ -11,48 +11,28 @@ import (
 	"github.com/Mikimiya/remnawave-node/pkg/xraycore"
 )
 
-// HandlerService manages user operations for Xray
+// HandlerService manages user operations for Xray.
+//
+// Concurrency: uses a global RWMutex shared with XrayService / StatsService / VisionService.
+// Mutations (AddUser, RemoveUser, etc.) acquire a WRITE lock.
+// Read-only queries (GetInboundUsers, GetInboundUsersCount) acquire a READ lock.
 type HandlerService struct {
 	logger   *zap.Logger
 	xrayCore *xraycore.Instance
 	internal *InternalService
 
-	// Per-inbound mutex for fine-grained locking
-	inboundMu    sync.RWMutex
-	inboundLocks map[string]*sync.Mutex
+	// Global RWMutex shared across all services.
+	mu *sync.RWMutex
 }
 
 // NewHandlerService creates a new HandlerService
-func NewHandlerService(xrayCore *xraycore.Instance, internal *InternalService, logger *zap.Logger) *HandlerService {
+func NewHandlerService(xrayCore *xraycore.Instance, internal *InternalService, mu *sync.RWMutex, logger *zap.Logger) *HandlerService {
 	return &HandlerService{
-		logger:       logger,
-		xrayCore:     xrayCore,
-		internal:     internal,
-		inboundLocks: make(map[string]*sync.Mutex),
+		logger:   logger,
+		xrayCore: xrayCore,
+		internal: internal,
+		mu:       mu,
 	}
-}
-
-// getInboundLock returns a mutex for a specific inbound tag
-func (s *HandlerService) getInboundLock(tag string) *sync.Mutex {
-	s.inboundMu.RLock()
-	lock, exists := s.inboundLocks[tag]
-	s.inboundMu.RUnlock()
-
-	if exists {
-		return lock
-	}
-
-	s.inboundMu.Lock()
-	defer s.inboundMu.Unlock()
-
-	// Double check after acquiring write lock
-	if lock, exists = s.inboundLocks[tag]; exists {
-		return lock
-	}
-
-	lock = &sync.Mutex{}
-	s.inboundLocks[tag] = lock
-	return lock
 }
 
 // CipherType represents Shadowsocks cipher types (matches Node.js CipherType enum)
@@ -136,6 +116,9 @@ func (s *HandlerService) removeUserFromInbound(ctx context.Context, tag, email s
 // AddUser adds user(s) to Xray (Node.js compatible format)
 // The request contains multiple UserData items (one per inbound) and hashData for tracking
 func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*AddUserResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		errMsg := "Xray not running"
 		return &AddUserResponse{Success: false, Error: &errMsg}, nil
@@ -157,9 +140,6 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 	// Step 2: Remove user from ALL known inbounds first (like Node.js does)
 	allTags := s.internal.GetXtlsConfigInbounds()
 	for _, tag := range allTags {
-		lock := s.getInboundLock(tag)
-		lock.Lock()
-
 		s.logger.Debug("Removing user from inbound before adding",
 			zap.String("username", username),
 			zap.String("tag", tag))
@@ -172,8 +152,6 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 		} else {
 			s.internal.RemoveUserFromInbound(req.HashData.VlessUUID, tag)
 		}
-
-		lock.Unlock()
 	}
 
 	// Step 3: Add user to each inbound based on type
@@ -181,9 +159,6 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 	successCount := 0
 
 	for _, item := range req.Data {
-		lock := s.getInboundLock(item.Tag)
-		lock.Lock()
-
 		var err error
 
 		switch item.Type {
@@ -211,7 +186,6 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 			}
 		default:
 			s.logger.Warn("Unknown user type", zap.String("type", item.Type))
-			lock.Unlock()
 			continue
 		}
 
@@ -232,8 +206,6 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 				zap.String("tag", item.Tag),
 				zap.String("type", item.Type))
 		}
-
-		lock.Unlock()
 	}
 
 	// Return success if at least one user was added
@@ -306,6 +278,9 @@ type AddUsersResponse struct {
 
 // AddUsers adds multiple users to Xray (Node.js compatible format)
 func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*AddUsersResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		errMsg := "Xray not running"
 		return &AddUsersResponse{Success: false, Error: &errMsg}, nil
@@ -324,20 +299,12 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 		// Step 1: Remove user from ALL known inbounds first
 		allTags := s.internal.GetXtlsConfigInbounds()
 		for _, tag := range allTags {
-			lock := s.getInboundLock(tag)
-			lock.Lock()
-
 			_ = s.removeUserFromInbound(ctx, tag, user.UserData.UserId)
 			s.internal.RemoveUserFromInbound(user.UserData.HashUuid, tag)
-
-			lock.Unlock()
 		}
 
 		// Step 2: Add user to each inbound based on type
 		for _, item := range user.InboundData {
-			lock := s.getInboundLock(item.Tag)
-			lock.Lock()
-
 			var err error
 
 			switch item.Type {
@@ -379,7 +346,6 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 				}
 			default:
 				s.logger.Warn("Unknown user type", zap.String("type", item.Type))
-				lock.Unlock()
 				continue
 			}
 
@@ -394,8 +360,6 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 					zap.String("userId", user.UserData.UserId),
 					zap.String("tag", item.Tag))
 			}
-
-			lock.Unlock()
 		}
 	}
 
@@ -424,6 +388,9 @@ type RemoveUserResponse struct {
 
 // RemoveUser removes a user from ALL known inbounds (Node.js compatible)
 func (s *HandlerService) RemoveUser(ctx context.Context, req *RemoveUserRequest) (*RemoveUserResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		errMsg := "Xray not running"
 		return &RemoveUserResponse{Success: false, Error: &errMsg}, nil
@@ -441,9 +408,6 @@ func (s *HandlerService) RemoveUser(ctx context.Context, req *RemoveUserRequest)
 
 	// Remove from all inbounds
 	for _, tag := range allTags {
-		lock := s.getInboundLock(tag)
-		lock.Lock()
-
 		s.logger.Debug("Removing user from inbound",
 			zap.String("username", req.Username),
 			zap.String("tag", tag))
@@ -455,8 +419,6 @@ func (s *HandlerService) RemoveUser(ctx context.Context, req *RemoveUserRequest)
 			successCount++
 		}
 		s.internal.RemoveUserFromInbound(req.HashData.VlessUUID, tag)
-
-		lock.Unlock()
 	}
 
 	s.logger.Info("Removed user from all inbounds",
@@ -496,6 +458,9 @@ type RemoveUsersResponse struct {
 
 // RemoveUsers removes multiple users from ALL known inbounds (Node.js compatible)
 func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersRequest) (*RemoveUsersResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		errMsg := "Xray not running"
 		return &RemoveUsersResponse{Success: false, Error: &errMsg}, nil
@@ -518,9 +483,6 @@ func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersReques
 	for _, user := range req.Users {
 		// Remove from all known inbounds
 		for _, tag := range allTags {
-			lock := s.getInboundLock(tag)
-			lock.Lock()
-
 			s.logger.Debug("Removing user from inbound",
 				zap.String("userId", user.UserId),
 				zap.String("tag", tag))
@@ -532,8 +494,6 @@ func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersReques
 				successCount++
 			}
 			s.internal.RemoveUserFromInbound(user.HashUuid, tag)
-
-			lock.Unlock()
 		}
 	}
 
@@ -555,11 +515,11 @@ func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersReques
 }
 
 // InboundUserInfo represents a user in an inbound (matches Node.js IInboundUser)
-// InboundUserInfo represents a user in an inbound (matches Node.js format)
+// Node.js returns: { username: string, level: number, protocol: string }
 type InboundUserInfo struct {
-	Username string  `json:"username"`
-	Email    *string `json:"email,omitempty"`
-	Level    *uint32 `json:"level,omitempty"`
+	Username string `json:"username"`
+	Level    uint32 `json:"level"`
+	Protocol string `json:"protocol"`
 }
 
 // GetInboundUsersResponse represents the response for getting inbound users
@@ -568,8 +528,13 @@ type GetInboundUsersResponse struct {
 }
 
 // GetInboundUsers returns the list of users in the specified inbound
-// Note: With embedded Xray-core, we rely on internal tracking
+// Note: With embedded Xray-core, there's no gRPC API to enumerate users directly.
+// We rely on internal tracking. Level defaults to 0 (same as addUser).
+// Protocol is empty since internal tracking doesn't store this information.
 func (s *HandlerService) GetInboundUsers(ctx context.Context, tag string) (*GetInboundUsersResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return &GetInboundUsersResponse{
 			Users: []InboundUserInfo{},
@@ -582,6 +547,8 @@ func (s *HandlerService) GetInboundUsers(ctx context.Context, tag string) (*GetI
 	for i, username := range trackedUsers {
 		users[i] = InboundUserInfo{
 			Username: username,
+			Level:    0,  // All users are added with level 0
+			Protocol: "", // Not tracked in embedded mode
 		}
 	}
 
@@ -599,6 +566,9 @@ type GetInboundUsersCountResponse struct {
 // GetInboundUsersCount returns the count of users in the specified inbound
 // Note: With embedded Xray-core, we rely on internal tracking
 func (s *HandlerService) GetInboundUsersCount(ctx context.Context, tag string) (*GetInboundUsersCountResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return &GetInboundUsersCountResponse{
 			Count: 0,

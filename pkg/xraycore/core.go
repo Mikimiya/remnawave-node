@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -31,9 +30,11 @@ import (
 	"github.com/xtls/xray-core/proxy/vless"
 )
 
-// Instance represents an embedded Xray-core instance
+// Instance represents an embedded Xray-core instance.
+// Thread safety: callers MUST hold the appropriate lock before calling any method.
+// Typically a global RWMutex is used at the service layer — write lock for
+// Start/Stop/Restart, read lock for AddUser/RemoveUser/GetStats etc.
 type Instance struct {
-	mu        sync.RWMutex
 	logger    *zap.Logger
 	instance  *core.Instance
 	config    []byte // Current config JSON
@@ -62,15 +63,12 @@ func (x *Instance) Version() string {
 
 // IsRunning returns true if Xray is running
 func (x *Instance) IsRunning() bool {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
+
 	return x.running && x.instance != nil
 }
 
 // Start starts Xray with the given JSON configuration
 func (x *Instance) Start(ctx context.Context, configJSON []byte) error {
-	x.mu.Lock()
-	defer x.mu.Unlock()
 
 	// Stop existing instance if running
 	if x.instance != nil {
@@ -116,8 +114,6 @@ func (x *Instance) Start(ctx context.Context, configJSON []byte) error {
 
 // Stop stops the Xray instance
 func (x *Instance) Stop() error {
-	x.mu.Lock()
-	defer x.mu.Unlock()
 
 	if x.instance == nil {
 		return nil
@@ -167,8 +163,6 @@ func (x *Instance) getInboundProxy(ctx context.Context, inboundTag string) (prox
 
 // AddUser adds a user to an inbound using MemoryUser
 func (x *Instance) AddUser(ctx context.Context, inboundTag string, user *protocol.MemoryUser) error {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return fmt.Errorf("Xray instance not running")
@@ -189,8 +183,6 @@ func (x *Instance) AddUser(ctx context.Context, inboundTag string, user *protoco
 
 // RemoveUser removes a user from an inbound
 func (x *Instance) RemoveUser(ctx context.Context, inboundTag string, email string) error {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return fmt.Errorf("Xray instance not running")
@@ -213,8 +205,6 @@ func (x *Instance) RemoveUser(ctx context.Context, inboundTag string, email stri
 
 // GetStats gets stats by pattern
 func (x *Instance) GetStats(ctx context.Context, pattern string, reset bool) (map[string]int64, error) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return nil, fmt.Errorf("Xray instance not running")
@@ -249,8 +239,6 @@ func (x *Instance) GetStats(ctx context.Context, pattern string, reset bool) (ma
 
 // GetSystemStats returns Xray system statistics
 func (x *Instance) GetSystemStats(ctx context.Context) (*SystemStats, error) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return nil, fmt.Errorf("Xray instance not running")
@@ -310,8 +298,6 @@ func (x *Instance) GetUserOnlineStatus(ctx context.Context, email string) (bool,
 
 // AddRoutingRule adds a routing rule to block an IP
 func (x *Instance) AddRoutingRule(ctx context.Context, ruleTag string, targetIP string, outboundTag string) error {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return fmt.Errorf("Xray instance not running")
@@ -391,8 +377,6 @@ func parseIPToBytes(ip string) []byte {
 
 // RemoveRoutingRule removes a routing rule by tag
 func (x *Instance) RemoveRoutingRule(ctx context.Context, ruleTag string) error {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return fmt.Errorf("Xray instance not running")
@@ -494,8 +478,6 @@ type UserStats struct {
 
 // GetUserStats gets traffic statistics for a specific user
 func (x *Instance) GetUserStats(ctx context.Context, email string, reset bool) (*UserStats, error) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return nil, fmt.Errorf("Xray instance not running")
@@ -534,8 +516,6 @@ func (x *Instance) GetUserStats(ctx context.Context, email string, reset bool) (
 
 // GetAllUserStats gets traffic statistics for all users
 func (x *Instance) GetAllUserStats(ctx context.Context, reset bool) ([]*UserStats, error) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
 
 	if x.instance == nil {
 		return nil, fmt.Errorf("Xray instance not running")
@@ -597,15 +577,13 @@ func (x *Instance) GetAllUserStats(ctx context.Context, reset bool) ([]*UserStat
 
 // GetConfig returns the current configuration JSON
 func (x *Instance) GetConfig() []byte {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
+
 	return x.config
 }
 
 // Uptime returns seconds since start
 func (x *Instance) Uptime() int64 {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
+
 	if x.startTime.IsZero() {
 		return 0
 	}

@@ -13,18 +13,24 @@ import (
 	"github.com/Mikimiya/remnawave-node/pkg/xraycore"
 )
 
-// StatsService manages traffic statistics
+// StatsService manages traffic statistics.
+//
+// Concurrency: uses the same global RWMutex shared across all services.
+// All stats queries acquire a READ lock since they don't mutate Xray state.
 type StatsService struct {
-	mu       sync.RWMutex
 	logger   *zap.Logger
 	xrayCore *xraycore.Instance
+
+	// Global RWMutex shared across all services.
+	mu *sync.RWMutex
 }
 
 // NewStatsService creates a new StatsService
-func NewStatsService(xrayCore *xraycore.Instance, logger *zap.Logger) *StatsService {
+func NewStatsService(xrayCore *xraycore.Instance, mu *sync.RWMutex, logger *zap.Logger) *StatsService {
 	return &StatsService{
 		logger:   logger,
 		xrayCore: xrayCore,
+		mu:       mu,
 	}
 }
 
@@ -51,6 +57,9 @@ type GetUserStatsResponse struct {
 
 // GetUserStats gets traffic statistics for a specific user
 func (s *StatsService) GetUserStats(ctx context.Context, req *GetUserStatsRequest) (*GetUserStatsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return nil, nil
 	}
@@ -83,6 +92,9 @@ type GetAllUsersStatsResponse struct {
 // GetAllUsersStats gets traffic statistics for all users
 // Always filters out users with zero traffic (matches Node.js behavior)
 func (s *StatsService) GetAllUsersStats(ctx context.Context, req *GetAllUsersStatsRequest) (*GetAllUsersStatsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return &GetAllUsersStatsResponse{Users: []*UserTraffic{}}, nil
 	}
@@ -128,6 +140,9 @@ var startTime = time.Now()
 
 // GetSystemStats gets system-wide statistics (matches Node.js GetSystemStatsResponseModel)
 func (s *StatsService) GetSystemStats(ctx context.Context) (*SystemStatsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		// Fallback to local Go stats
 		var memStats runtime.MemStats
@@ -193,6 +208,9 @@ type GetUsersStatsAndResetResponse struct {
 
 // GetUsersStatsAndReset gets traffic for specific users and resets counters
 func (s *StatsService) GetUsersStatsAndReset(ctx context.Context, req *GetUsersStatsAndResetRequest) (*GetUsersStatsAndResetResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return &GetUsersStatsAndResetResponse{Users: []*UserTraffic{}}, nil
 	}
@@ -229,6 +247,9 @@ type GetUserOnlineStatusResponse struct {
 
 // GetUserOnlineStatus checks if a user is currently online
 func (s *StatsService) GetUserOnlineStatus(ctx context.Context, req *GetUserOnlineStatusRequest) (*GetUserOnlineStatusResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return &GetUserOnlineStatusResponse{IsOnline: false}, nil
 	}
@@ -266,6 +287,9 @@ type GetInboundStatsResponse struct {
 
 // GetInboundStats gets traffic statistics for a specific inbound
 func (s *StatsService) GetInboundStats(ctx context.Context, req *GetInboundStatsRequest) (*GetInboundStatsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return &GetInboundStatsResponse{Inbound: req.Tag}, nil
 	}
@@ -317,6 +341,9 @@ type GetOutboundStatsResponse struct {
 
 // GetOutboundStats gets traffic statistics for a specific outbound
 func (s *StatsService) GetOutboundStats(ctx context.Context, req *GetOutboundStatsRequest) (*GetOutboundStatsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return &GetOutboundStatsResponse{Outbound: req.Tag}, nil
 	}
@@ -358,12 +385,24 @@ type GetAllInboundsStatsResponse struct {
 
 // GetAllInboundsStats gets traffic statistics for all inbounds
 func (s *StatsService) GetAllInboundsStats(ctx context.Context, req *GetAllInboundsStatsRequest) (*GetAllInboundsStatsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result, err := s.getAllInboundsStatsLocked(ctx, req.Reset)
+	if err != nil {
+		return nil, err
+	}
+	return &GetAllInboundsStatsResponse{Inbounds: result}, nil
+}
+
+// getAllInboundsStatsLocked is the internal unlocked version (caller must hold lock)
+func (s *StatsService) getAllInboundsStatsLocked(ctx context.Context, reset bool) ([]*InboundStats, error) {
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
-		return &GetAllInboundsStatsResponse{Inbounds: []*InboundStats{}}, nil
+		return []*InboundStats{}, nil
 	}
 
 	// Get all stats with inbound prefix
-	stats, err := s.xrayCore.GetStats(ctx, "inbound>>>", req.Reset)
+	stats, err := s.xrayCore.GetStats(ctx, "inbound>>>", reset)
 	if err != nil {
 		s.logger.Warn("Failed to get all inbounds stats", zap.Error(err))
 		return nil, err
@@ -396,7 +435,7 @@ func (s *StatsService) GetAllInboundsStats(ctx context.Context, req *GetAllInbou
 		result = append(result, inbound)
 	}
 
-	return &GetAllInboundsStatsResponse{Inbounds: result}, nil
+	return result, nil
 }
 
 // GetAllOutboundsStatsRequest represents request to get all outbounds stats
@@ -411,12 +450,24 @@ type GetAllOutboundsStatsResponse struct {
 
 // GetAllOutboundsStats gets traffic statistics for all outbounds
 func (s *StatsService) GetAllOutboundsStats(ctx context.Context, req *GetAllOutboundsStatsRequest) (*GetAllOutboundsStatsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result, err := s.getAllOutboundsStatsLocked(ctx, req.Reset)
+	if err != nil {
+		return nil, err
+	}
+	return &GetAllOutboundsStatsResponse{Outbounds: result}, nil
+}
+
+// getAllOutboundsStatsLocked is the internal unlocked version (caller must hold lock)
+func (s *StatsService) getAllOutboundsStatsLocked(ctx context.Context, reset bool) ([]*OutboundStats, error) {
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
-		return &GetAllOutboundsStatsResponse{Outbounds: []*OutboundStats{}}, nil
+		return []*OutboundStats{}, nil
 	}
 
 	// Get all stats with outbound prefix
-	stats, err := s.xrayCore.GetStats(ctx, "outbound>>>", req.Reset)
+	stats, err := s.xrayCore.GetStats(ctx, "outbound>>>", reset)
 	if err != nil {
 		s.logger.Warn("Failed to get all outbounds stats", zap.Error(err))
 		return nil, err
@@ -449,7 +500,7 @@ func (s *StatsService) GetAllOutboundsStats(ctx context.Context, req *GetAllOutb
 		result = append(result, outbound)
 	}
 
-	return &GetAllOutboundsStatsResponse{Outbounds: result}, nil
+	return result, nil
 }
 
 // GetCombinedStatsRequest represents request to get combined stats
@@ -465,18 +516,21 @@ type GetCombinedStatsResponse struct {
 
 // GetCombinedStats gets traffic statistics for all inbounds and outbounds
 func (s *StatsService) GetCombinedStats(ctx context.Context, req *GetCombinedStatsRequest) (*GetCombinedStatsResponse, error) {
-	inboundsResp, err := s.GetAllInboundsStats(ctx, &GetAllInboundsStatsRequest{Reset: req.Reset})
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	inboundsResp, err := s.getAllInboundsStatsLocked(ctx, req.Reset)
 	if err != nil {
 		return nil, err
 	}
 
-	outboundsResp, err := s.GetAllOutboundsStats(ctx, &GetAllOutboundsStatsRequest{Reset: req.Reset})
+	outboundsResp, err := s.getAllOutboundsStatsLocked(ctx, req.Reset)
 	if err != nil {
 		return nil, err
 	}
 
 	return &GetCombinedStatsResponse{
-		Inbounds:  inboundsResp.Inbounds,
-		Outbounds: outboundsResp.Outbounds,
+		Inbounds:  inboundsResp,
+		Outbounds: outboundsResp,
 	}, nil
 }

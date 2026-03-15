@@ -3,16 +3,19 @@ package services
 
 import (
 	"encoding/json"
-	"sync"
 
 	"go.uber.org/zap"
 
 	"github.com/Mikimiya/remnawave-node/pkg/hashedset"
 )
 
-// InternalService manages internal node state
+// InternalService manages internal node state.
+//
+// Thread safety: InternalService does NOT have its own mutex.
+// All methods must be called while the global RWMutex is already held by the caller
+// (XrayService, HandlerService, etc.). This is safe because all calls come from
+// service methods that already hold the appropriate lock.
 type InternalService struct {
-	mu               sync.RWMutex
 	logger           *zap.Logger
 	hashedSet        *hashedset.HashedSet
 	config           json.RawMessage
@@ -20,8 +23,11 @@ type InternalService struct {
 
 	// User-Inbound tracking: email -> set of inbound tags
 	userInboundMap map[string]map[string]struct{}
-	// Per-inbound hash sets for fine-grained change detection
-	inboundHashSets map[string]*hashedset.HashedSet
+	// Per-inbound hash sets for fine-grained change detection.
+	// Uses InboundHashedSet which replicates @remnawave/hashed-set (DJB2 dual XOR).
+	// The hash dynamically updates when users are added/removed via
+	// AddUserToInbound / RemoveUserFromInbound, matching Node.js behavior.
+	inboundHashSets map[string]*hashedset.InboundHashedSet
 	// Empty config hash (config without users)
 	emptyConfigHash string
 	// All known inbound tags (used for removing users from all inbounds)
@@ -40,15 +46,13 @@ func NewInternalService(cfg *InternalConfig, logger *zap.Logger) *InternalServic
 		hashedSet:          hashedset.New(),
 		disableHashCheck:   cfg.DisableHashCheck,
 		userInboundMap:     make(map[string]map[string]struct{}),
-		inboundHashSets:    make(map[string]*hashedset.HashedSet),
+		inboundHashSets:    make(map[string]*hashedset.InboundHashedSet),
 		xtlsConfigInbounds: make(map[string]struct{}),
 	}
 }
 
 // GetXtlsConfigInbounds returns all known inbound tags
 func (s *InternalService) GetXtlsConfigInbounds() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	result := make([]string, 0, len(s.xtlsConfigInbounds))
 	for tag := range s.xtlsConfigInbounds {
@@ -59,20 +63,17 @@ func (s *InternalService) GetXtlsConfigInbounds() []string {
 
 // AddXtlsConfigInbound adds an inbound tag to the known set
 func (s *InternalService) AddXtlsConfigInbound(tag string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
 	s.xtlsConfigInbounds[tag] = struct{}{}
 }
 
 // Cleanup clears all internal state (called when Xray stops)
 func (s *InternalService) Cleanup() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.logger.Info("Cleaning up internal service state")
 
 	s.userInboundMap = make(map[string]map[string]struct{})
-	s.inboundHashSets = make(map[string]*hashedset.HashedSet)
+	s.inboundHashSets = make(map[string]*hashedset.InboundHashedSet)
 	s.xtlsConfigInbounds = make(map[string]struct{})
 	s.config = nil
 	s.emptyConfigHash = ""
@@ -80,8 +81,6 @@ func (s *InternalService) Cleanup() {
 
 // GetUserInbounds returns all inbound tags that a user belongs to
 func (s *InternalService) GetUserInbounds(email string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	tags, exists := s.userInboundMap[email]
 	if !exists {
@@ -95,35 +94,70 @@ func (s *InternalService) GetUserInbounds(email string) []string {
 	return result
 }
 
-// AddUserToInbound records that a user belongs to an inbound
+// AddUserToInbound records that a user belongs to an inbound.
+// Also adds the user to the InboundHashedSet so the DJB2 hash stays in sync.
+// This matches Node.js: usersSet.add(user)
 func (s *InternalService) AddUserToInbound(email, tag string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.userInboundMap[email] == nil {
 		s.userInboundMap[email] = make(map[string]struct{})
 	}
 	s.userInboundMap[email][tag] = struct{}{}
+
+	// Update the InboundHashedSet for this inbound
+	hs, exists := s.inboundHashSets[tag]
+	if !exists {
+		// Inbound not yet tracked — create a new InboundHashedSet
+		s.logger.Warn("Inbound not found in inboundHashSets, creating new one",
+			zap.String("tag", tag))
+		hs = hashedset.NewInboundHashedSet()
+		s.inboundHashSets[tag] = hs
+	}
+	hs.Add(email)
 }
 
-// RemoveUserFromInbound removes a user from an inbound tracking
+// RemoveUserFromInbound removes a user from an inbound tracking.
+// Also removes the user from the InboundHashedSet so the DJB2 hash stays in sync.
+// When the inbound has no remaining users, also cleans up xtlsConfigInbounds and
+// inboundHashSets (matches Node.js behavior where both inboundsHashMap and
+// xtlsConfigInbounds are cleared when usersSet.size === 0).
 func (s *InternalService) RemoveUserFromInbound(email, tag string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if tags, exists := s.userInboundMap[email]; exists {
 		delete(tags, tag)
-		// Clean up if no more inbounds
+		// Clean up if no more inbounds for this user
 		if len(tags) == 0 {
 			delete(s.userInboundMap, email)
 		}
 	}
+
+	// Update the InboundHashedSet — matches Node.js: usersSet.delete(user)
+	if hs, exists := s.inboundHashSets[tag]; exists {
+		hs.Delete(email)
+	}
+
+	// Check if the inbound now has zero users — if so, clean up
+	// (matches Node.js: xtlsConfigInbounds.delete + inboundsHashMap.delete when size === 0)
+	if s.isInboundEmpty(tag) {
+		delete(s.xtlsConfigInbounds, tag)
+		delete(s.inboundHashSets, tag)
+		s.logger.Warn("Inbound has no users, clearing from tracking",
+			zap.String("tag", tag))
+	}
+}
+
+// isInboundEmpty checks if any user still belongs to the given inbound tag
+func (s *InternalService) isInboundEmpty(tag string) bool {
+	for _, tags := range s.userInboundMap {
+		if _, exists := tags[tag]; exists {
+			return false
+		}
+	}
+	return true
 }
 
 // RemoveUserFromAllInbounds removes a user from all inbound tracking
 func (s *InternalService) RemoveUserFromAllInbounds(email string) []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	tags, exists := s.userInboundMap[email]
 	if !exists {
@@ -140,8 +174,6 @@ func (s *InternalService) RemoveUserFromAllInbounds(email string) []string {
 
 // GetUsersInInbound returns all user emails in a specific inbound
 func (s *InternalService) GetUsersInInbound(tag string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	var users []string
 	for email, tags := range s.userInboundMap {
@@ -154,8 +186,6 @@ func (s *InternalService) GetUsersInInbound(tag string) []string {
 
 // GetUsersCountInInbound returns the count of users in a specific inbound
 func (s *InternalService) GetUsersCountInInbound(tag string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	count := 0
 	for _, tags := range s.userInboundMap {
@@ -171,7 +201,8 @@ type XrayInbound struct {
 	Tag      string `json:"tag"`
 	Settings struct {
 		Clients []struct {
-			Email string `json:"email"`
+			ID    string `json:"id"`    // UUID — used by Node.js HashedSet for tracking
+			Email string `json:"email"` // email/username — used by Xray-core for user operations
 		} `json:"clients"`
 	} `json:"settings"`
 }
@@ -184,8 +215,6 @@ type XrayConfigParsed struct {
 // ExtractUsersFromConfig parses config and builds user-inbound mapping
 // Also stores the incoming hashes for later comparison
 func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes *InboundHashes) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	var parsed XrayConfigParsed
 	if err := json.Unmarshal(config, &parsed); err != nil {
@@ -194,7 +223,7 @@ func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes 
 
 	// Clear existing mappings
 	s.userInboundMap = make(map[string]map[string]struct{})
-	s.inboundHashSets = make(map[string]*hashedset.HashedSet)
+	s.inboundHashSets = make(map[string]*hashedset.InboundHashedSet)
 	s.xtlsConfigInbounds = make(map[string]struct{})
 
 	// Build valid tags set from incoming hashes
@@ -212,7 +241,7 @@ func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes 
 		}
 
 		// Only process inbounds that are in the valid tags (from hashes)
-		incomingHash, isValid := validTags[inbound.Tag]
+		_, isValid := validTags[inbound.Tag]
 		if hashes != nil && !isValid {
 			continue
 		}
@@ -220,30 +249,38 @@ func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes 
 		// Add to known inbounds set
 		s.xtlsConfigInbounds[inbound.Tag] = struct{}{}
 
-		// Create hash set for this inbound and store the incoming hash
-		hs := hashedset.New()
-		if incomingHash != "" {
-			// Store the incoming hash directly (using "users" as the key)
-			hs.SetHashValue("users", incomingHash)
-		}
+		// Create InboundHashedSet for this inbound, populated from client IDs.
+		// This matches Node.js behavior: the HashedSet contains client.id values
+		// and dynamically computes a DJB2 dual XOR hash (hash64String).
+		// When users are added/removed later, the hash updates automatically.
+		hs := hashedset.NewInboundHashedSet()
 		s.inboundHashSets[inbound.Tag] = hs
 
-		// Map users to this inbound
+		// Map users to this inbound and populate the InboundHashedSet
+		// Node.js uses client.id (UUID) as the tracking key in its HashedSet.
+		// handler.go also uses hashData.vlessUuid when calling AddUserToInbound.
+		// We use client.ID (UUID) when available, falling back to client.Email.
 		for _, client := range inbound.Settings.Clients {
-			if client.Email == "" {
+			trackingKey := client.ID
+			if trackingKey == "" {
+				trackingKey = client.Email
+			}
+			if trackingKey == "" {
 				continue
 			}
-			if s.userInboundMap[client.Email] == nil {
-				s.userInboundMap[client.Email] = make(map[string]struct{})
+			if s.userInboundMap[trackingKey] == nil {
+				s.userInboundMap[trackingKey] = make(map[string]struct{})
 			}
-			s.userInboundMap[client.Email][inbound.Tag] = struct{}{}
+			s.userInboundMap[trackingKey][inbound.Tag] = struct{}{}
+			// Add to the InboundHashedSet — hash updates via DJB2 XOR
+			hs.Add(trackingKey)
 		}
 
 		// Log each inbound with user count (INFO level for visibility)
 		s.logger.Info("Loaded inbound from config",
 			zap.String("tag", inbound.Tag),
 			zap.Int("users", len(inbound.Settings.Clients)),
-			zap.String("hash", incomingHash))
+			zap.String("hash", hs.Hash64String()))
 	}
 
 	s.logger.Info("Extracted users from config",
@@ -284,8 +321,6 @@ func (h *InboundHashes) InboundsCount() int {
 
 // IsNeedRestartCore checks if core restart is needed by comparing hashes
 func (s *InternalService) IsNeedRestartCore(hashes *InboundHashes) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	if s.disableHashCheck {
 		return true
@@ -313,14 +348,16 @@ func (s *InternalService) IsNeedRestartCore(hashes *InboundHashes) bool {
 		return true
 	}
 
-	// Compare per-inbound hashes (using array format)
+	// Compare per-inbound hashes (using array format).
+	// The local InboundHashedSet computes hash64String via DJB2 dual XOR,
+	// matching the panel's @remnawave/hashed-set algorithm.
 	for _, item := range hashes.Inbounds {
 		hs, exists := s.inboundHashSets[item.Tag]
 		if !exists {
 			s.logger.Warn("New inbound detected", zap.String("tag", item.Tag))
 			return true
 		}
-		currentHash, _ := hs.GetHash("users")
+		currentHash := hs.Hash64String()
 		if currentHash != item.Hash {
 			s.logger.Warn("User configuration changed for inbound",
 				zap.String("tag", item.Tag),
@@ -347,45 +384,39 @@ func (s *InternalService) IsNeedRestartCore(hashes *InboundHashes) bool {
 	return false
 }
 
-// UpdateInboundHash updates the hash for a specific inbound
+// UpdateInboundHash is a no-op for compatibility. With InboundHashedSet, hashes are
+// dynamically maintained via Add/Delete. This method is kept for interface compatibility.
 func (s *InternalService) UpdateInboundHash(tag string, data json.RawMessage) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	hs, exists := s.inboundHashSets[tag]
+	_, exists := s.inboundHashSets[tag]
 	if !exists {
-		hs = hashedset.New()
-		s.inboundHashSets[tag] = hs
+		s.inboundHashSets[tag] = hashedset.NewInboundHashedSet()
 	}
-
-	return hs.UpdateIfChanged("users", data)
+	// With InboundHashedSet, the hash is automatically computed from members.
+	// There's nothing to "update" from external data — return false (no change).
+	return false, nil
 }
 
 // SetEmptyConfigHash sets the hash for empty config (without users)
 func (s *InternalService) SetEmptyConfigHash(hash string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
 	s.emptyConfigHash = hash
 }
 
 // GetEmptyConfigHash returns the current empty config hash
 func (s *InternalService) GetEmptyConfigHash() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+
 	return s.emptyConfigHash
 }
 
 // GetInboundHashes returns all current hashes
 func (s *InternalService) GetInboundHashes() *InboundHashes {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	inbounds := make([]InboundHashItem, 0, len(s.inboundHashSets))
 	for tag, hs := range s.inboundHashSets {
-		hash, _ := hs.GetHash("users")
 		inbounds = append(inbounds, InboundHashItem{
 			Tag:  tag,
-			Hash: hash,
+			Hash: hs.Hash64String(),
 		})
 	}
 
@@ -397,8 +428,7 @@ func (s *InternalService) GetInboundHashes() *InboundHashes {
 
 // GetUserCount returns the total number of tracked users
 func (s *InternalService) GetUserCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+
 	return len(s.userInboundMap)
 }
 
@@ -410,8 +440,6 @@ type GetConfigResponse struct {
 
 // GetConfig returns the current stored configuration
 func (s *InternalService) GetConfig() *GetConfigResponse {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	hash, _ := s.hashedSet.GetHash("config")
 	return &GetConfigResponse{
@@ -434,8 +462,6 @@ type SetConfigResponse struct {
 
 // SetConfig stores a configuration and checks for changes
 func (s *InternalService) SetConfig(req *SetConfigRequest) *SetConfigResponse {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Check if config has changed
 	changed := true
@@ -474,8 +500,6 @@ type CheckHashResponse struct {
 
 // CheckHash checks if data has changed from stored hash
 func (s *InternalService) CheckHash(req *CheckHashRequest) (*CheckHashResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	if s.disableHashCheck {
 		return &CheckHashResponse{Changed: true}, nil
@@ -507,8 +531,6 @@ type UpdateHashResponse struct {
 
 // UpdateHash updates the hash for a key if data changed
 func (s *InternalService) UpdateHash(req *UpdateHashRequest) (*UpdateHashResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	updated, err := s.hashedSet.UpdateIfChanged(req.Key, req.Data)
 	if err != nil {
@@ -524,8 +546,7 @@ func (s *InternalService) UpdateHash(req *UpdateHashRequest) (*UpdateHashRespons
 
 // ClearHashSet clears all stored hashes
 func (s *InternalService) ClearHashSet() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
 	s.hashedSet.Clear()
 	s.logger.Info("Cleared hash set")
 }

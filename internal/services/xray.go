@@ -4,14 +4,12 @@ package services
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,20 +17,14 @@ import (
 	"github.com/Mikimiya/remnawave-node/pkg/xraycore"
 )
 
-// ErrXrayAlreadyProcessing indicates Xray is already being started/restarted
-var ErrXrayAlreadyProcessing = errors.New("Xray is already being processed")
-
 // XrayService manages Xray-core process and configuration
 type XrayService struct {
-	mu           sync.RWMutex
+	mu           *sync.RWMutex
 	logger       *zap.Logger
 	xrayCore     *xraycore.Instance
 	internal     *InternalService
 	configDir    string
 	isConfigured bool
-
-	// Concurrency protection
-	isStartProcessing atomic.Bool
 
 	// Online status tracking
 	isXrayOnline bool
@@ -52,8 +44,9 @@ type XrayConfig struct {
 }
 
 // NewXrayService creates a new XrayService
-func NewXrayService(cfg *XrayConfig, xrayCore *xraycore.Instance, internal *InternalService, logger *zap.Logger) *XrayService {
+func NewXrayService(cfg *XrayConfig, xrayCore *xraycore.Instance, internal *InternalService, mu *sync.RWMutex, logger *zap.Logger) *XrayService {
 	return &XrayService{
+		mu:                    mu,
 		logger:                logger,
 		xrayCore:              xrayCore,
 		internal:              internal,
@@ -69,7 +62,7 @@ func (s *XrayService) GetXrayCore() *xraycore.Instance {
 	return s.xrayCore
 }
 
-// checkXrayHealth checks if Xray is responding
+// checkXrayHealth checks if Xray is responding (single attempt, used for quick probes)
 func (s *XrayService) checkXrayHealth(ctx context.Context) bool {
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
 		return false
@@ -78,6 +71,37 @@ func (s *XrayService) checkXrayHealth(ctx context.Context) bool {
 	// Try to get system stats to verify it's working
 	_, err := s.xrayCore.GetSystemStats(ctx)
 	return err == nil
+}
+
+// checkXrayHealthWithRetry checks if Xray is responding with retries.
+// Matches Node.js pRetry behavior: 10 retries, 2-second intervals.
+// Used after Start/Restart to give Xray time to initialize.
+func (s *XrayService) checkXrayHealthWithRetry(ctx context.Context) bool {
+	const maxRetries = 10
+	const retryInterval = 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if s.checkXrayHealth(ctx) {
+			return true
+		}
+
+		s.logger.Debug("Health check attempt failed, retrying...",
+			zap.Int("attempt", attempt),
+			zap.Int("retriesLeft", maxRetries-attempt))
+
+		if attempt < maxRetries {
+			select {
+			case <-ctx.Done():
+				s.logger.Warn("Health check cancelled by context")
+				return false
+			case <-time.After(retryInterval):
+			}
+		}
+	}
+
+	s.logger.Error("All health check attempts failed",
+		zap.Int("totalAttempts", maxRetries))
+	return false
 }
 
 // XrayConfigData represents the Xray configuration file structure
@@ -273,12 +297,6 @@ func (s *XrayService) Start(ctx context.Context, req *StartRequest) (*StartRespo
 	}
 
 	// Check for concurrent processing
-	if !s.isStartProcessing.CompareAndSwap(false, true) {
-		errMsg := "Request already in progress"
-		return errorResponse(errMsg), nil
-	}
-	defer s.isStartProcessing.Store(false)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -376,8 +394,8 @@ func (s *XrayService) Start(ctx context.Context, req *StartRequest) (*StartRespo
 		return errorResponse(err.Error()), nil
 	}
 
-	// Verify Xray is actually responding
-	isStarted := s.checkXrayHealth(ctx)
+	// Verify Xray is actually responding (with retries, like Node.js pRetry)
+	isStarted := s.checkXrayHealthWithRetry(ctx)
 	if !isStarted {
 		s.isXrayOnline = false
 		s.logger.Error("Xray failed to start - health check failed",
@@ -451,16 +469,6 @@ type RestartResponse struct {
 func (s *XrayService) Restart(ctx context.Context, req *RestartRequest) (*RestartResponse, error) {
 	startTime := time.Now()
 
-	// Check for concurrent processing
-	if !s.isStartProcessing.CompareAndSwap(false, true) {
-		return &RestartResponse{
-			Success: false,
-			Message: "Request already in progress",
-			Version: s.GetVersion(),
-		}, nil
-	}
-	defer s.isStartProcessing.Store(false)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -529,8 +537,8 @@ func (s *XrayService) Restart(ctx context.Context, req *RestartRequest) (*Restar
 		}, nil
 	}
 
-	// Verify health
-	isStarted := s.checkXrayHealth(ctx)
+	// Verify health (with retries, like Node.js pRetry)
+	isStarted := s.checkXrayHealthWithRetry(ctx)
 	if !isStarted {
 		s.isXrayOnline = false
 		s.logger.Error("Xray restart failed - health check failed")
@@ -564,6 +572,9 @@ type GetStatusResponse struct {
 
 // GetStatus returns the current status and version of Xray
 func (s *XrayService) GetStatus(ctx context.Context) (*GetStatusResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	isRunning := s.xrayCore.IsRunning()
 
 	var version *string
@@ -616,8 +627,8 @@ func (s *XrayService) RestoreStart(ctx context.Context) error {
 		return fmt.Errorf("restore failed: %w", err)
 	}
 
-	// Verify health
-	if !s.checkXrayHealth(ctx) {
+	// Verify health (with retries)
+	if !s.checkXrayHealthWithRetry(ctx) {
 		s.isXrayOnline = false
 		return fmt.Errorf("restored Xray health check failed")
 	}
@@ -640,8 +651,7 @@ func (s *XrayService) IsRunning(ctx context.Context) bool {
 // GetNodeHealthCheck returns the node health check response (Node.js compatible)
 func (s *XrayService) GetNodeHealthCheck(ctx context.Context) *NodeHealthCheckResponse {
 	s.mu.RLock()
-	isXrayOnline := s.isXrayOnline
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
 
 	var xrayVersion *string
 	if v := s.GetVersion(); v != "" && v != "unknown" {
@@ -651,7 +661,7 @@ func (s *XrayService) GetNodeHealthCheck(ctx context.Context) *NodeHealthCheckRe
 	return &NodeHealthCheckResponse{
 		Response: NodeHealthCheckResponseData{
 			IsAlive:                  true,
-			XrayInternalStatusCached: isXrayOnline,
+			XrayInternalStatusCached: s.isXrayOnline,
 			XrayVersion:              xrayVersion,
 			NodeVersion:              nodeVersion,
 		},

@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Mikimiya/remnawave-node/internal/config"
@@ -56,17 +57,23 @@ func New(cfg *config.Config, log *logger.Logger) (*Server, error) {
 		DisableHashCheck: cfg.DisableHashedSetCheck,
 	}, log.Desugar())
 
+	// Single global mutex shared across ALL services.
+	// This replicates Node.js single-threaded semantics:
+	//   - Write lock for mutations (start/stop/restart, addUser/removeUser, blockIP)
+	//   - Read lock for queries (getStats, healthcheck, getInboundUsers, getBlockedIPs)
+	mu := &sync.RWMutex{}
+
 	xrayService := services.NewXrayService(&services.XrayConfig{
 		ConfigDir:             "/var/lib/remnawave-node",
 		DisableHashedSetCheck: cfg.DisableHashedSetCheck,
 		PortMap:               cfg.PortMap,
-	}, xrayCoreInstance, internalService, log.Desugar())
+	}, xrayCoreInstance, internalService, mu, log.Desugar())
 
-	handlerService := services.NewHandlerService(xrayCoreInstance, internalService, log.Desugar())
-	statsService := services.NewStatsService(xrayCoreInstance, log.Desugar())
+	handlerService := services.NewHandlerService(xrayCoreInstance, internalService, mu, log.Desugar())
+	statsService := services.NewStatsService(xrayCoreInstance, mu, log.Desugar())
 	visionService := services.NewVisionService(&services.VisionConfig{
-		BlockTag: "block",
-	}, xrayCoreInstance, log.Desugar())
+		BlockTag: "BLOCK",
+	}, xrayCoreInstance, mu, log.Desugar())
 
 	srv := &Server{
 		cfg:             cfg,

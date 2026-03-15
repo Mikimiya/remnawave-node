@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"sync"
 
 	"go.uber.org/zap"
@@ -12,13 +13,19 @@ import (
 	"github.com/Mikimiya/remnawave-node/pkg/xraycore"
 )
 
-// VisionService manages IP blocking via Xray router rules
+// VisionService manages IP blocking via Xray router rules.
+//
+// Concurrency: uses the same global RWMutex shared across all services.
+// BlockIP / UnblockIP / ClearBlockedIPs acquire a WRITE lock (mutations).
+// GetBlockedIPs acquires a READ lock.
 type VisionService struct {
-	mu         sync.RWMutex
 	logger     *zap.Logger
 	xrayCore   *xraycore.Instance
 	blockedIPs map[string]string // IP -> ruleTag (MD5 hash)
 	blockTag   string
+
+	// Global RWMutex shared across all services.
+	mu *sync.RWMutex
 }
 
 // VisionConfig holds Vision service configuration
@@ -27,7 +34,7 @@ type VisionConfig struct {
 }
 
 // NewVisionService creates a new VisionService
-func NewVisionService(cfg *VisionConfig, xrayCore *xraycore.Instance, logger *zap.Logger) *VisionService {
+func NewVisionService(cfg *VisionConfig, xrayCore *xraycore.Instance, mu *sync.RWMutex, logger *zap.Logger) *VisionService {
 	blockTag := cfg.BlockTag
 	if blockTag == "" {
 		blockTag = "BLOCK"
@@ -37,12 +44,20 @@ func NewVisionService(cfg *VisionConfig, xrayCore *xraycore.Instance, logger *za
 		xrayCore:   xrayCore,
 		blockedIPs: make(map[string]string),
 		blockTag:   blockTag,
+		mu:         mu,
 	}
 }
 
-// getIPHash returns MD5 hash of an IP address (like Node.js object-hash)
+// getIPHash returns MD5 hash of an IP address, compatible with Node.js object-hash.
+//
+// Node.js object-hash serializes strings as "string:<length>:<value>" before hashing.
+// See: https://github.com/puleos/object-hash/blob/main/index.js (_string method)
+//
+//	objectHash("192.168.1.1", {algorithm:'md5', encoding:'hex'})
+//	  => MD5("string:11:192.168.1.1")
 func (s *VisionService) getIPHash(ip string) string {
-	hash := md5.Sum([]byte(ip))
+	serialized := fmt.Sprintf("string:%d:%s", len(ip), ip)
+	hash := md5.Sum([]byte(serialized))
 	return hex.EncodeToString(hash[:])
 }
 
