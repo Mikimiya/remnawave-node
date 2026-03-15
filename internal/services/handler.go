@@ -357,11 +357,25 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 				}
 			case "shadowsocks":
 				cipherType := xraycore.CipherTypeFromInt(7) // chacha20-poly1305 default
+				s.logger.Info("Creating shadowsocks user",
+					zap.String("userId", user.UserData.UserId),
+					zap.String("tag", item.Tag),
+					zap.Int("cipherType", 7))
 				u, createErr := xraycore.CreateShadowsocksUser(user.UserData.UserId, user.UserData.SsPassword, cipherType, 0)
 				if createErr != nil {
+					s.logger.Error("Failed to create shadowsocks user", zap.Error(createErr))
 					err = createErr
 				} else {
 					err = s.xrayCore.AddUser(ctx, item.Tag, u)
+					if err != nil {
+						s.logger.Error("Failed to add shadowsocks user to xray",
+							zap.String("tag", item.Tag),
+							zap.Error(err))
+					} else {
+						s.logger.Info("Successfully added shadowsocks user",
+							zap.String("userId", user.UserData.UserId),
+							zap.String("tag", item.Tag))
+					}
 				}
 			default:
 				s.logger.Warn("Unknown user type", zap.String("type", item.Type))

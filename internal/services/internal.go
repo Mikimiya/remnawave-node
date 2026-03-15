@@ -239,7 +239,8 @@ func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes 
 			s.userInboundMap[client.Email][inbound.Tag] = struct{}{}
 		}
 
-		s.logger.Debug("Extracted inbound",
+		// Log each inbound with user count (INFO level for visibility)
+		s.logger.Info("Loaded inbound from config",
 			zap.String("tag", inbound.Tag),
 			zap.Int("users", len(inbound.Settings.Clients)),
 			zap.String("hash", incomingHash))
@@ -247,7 +248,7 @@ func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes 
 
 	s.logger.Info("Extracted users from config",
 		zap.Int("inbounds", len(s.xtlsConfigInbounds)),
-		zap.Int("users", len(s.userInboundMap)))
+		zap.Int("totalUsers", len(s.userInboundMap)))
 
 	return nil
 }
