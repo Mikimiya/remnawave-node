@@ -101,11 +101,17 @@ detect_platform() {
     info "Detected platform: ${PLATFORM}"
 }
 
+# Extract tag_name from GitHub API JSON response without jq
+# Usage: echo '{"tag_name":"v1.0.0"}' | extract_tag_name
+extract_tag_name() {
+    grep -oE '"tag_name"\s*:\s*"[^"]*"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//;s/"//'
+}
+
 # Check required commands
 check_dependencies() {
     local missing_deps=()
 
-    for cmd in curl jq tar; do
+    for cmd in curl tar; do
         if ! command -v "$cmd" &> /dev/null; then
             missing_deps+=("$cmd")
         fi
@@ -115,8 +121,8 @@ check_dependencies() {
         info "Installing missing dependencies: ${missing_deps[*]}"
         
         if command -v apt-get &> /dev/null; then
-            apt-get update -qq
-            apt-get install -y -qq "${missing_deps[@]}"
+            apt-get update -qq 2>/dev/null || warning "apt-get update had errors, continuing anyway..."
+            apt-get install -y -qq "${missing_deps[@]}" || error "Failed to install dependencies: ${missing_deps[*]}"
         elif command -v yum &> /dev/null; then
             yum install -y -q "${missing_deps[@]}"
         elif command -v dnf &> /dev/null; then
@@ -135,7 +141,7 @@ check_dependencies() {
 get_latest_version() {
     info "Fetching latest release version..."
     
-    LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name')
+    LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | extract_tag_name)
     
     if [[ -z "$LATEST_VERSION" || "$LATEST_VERSION" == "null" ]]; then
         error "Failed to get latest version from GitHub"
@@ -199,7 +205,7 @@ download_and_install() {
 download_geo_files() {
     # Get latest geoip release
     info "Fetching latest geoip version..."
-    local geoip_version=$(curl -fsSL "https://api.github.com/repos/v2fly/geoip/releases/latest" | jq -r '.tag_name' 2>/dev/null)
+    local geoip_version=$(curl -fsSL "https://api.github.com/repos/v2fly/geoip/releases/latest" | extract_tag_name 2>/dev/null)
     
     if [[ -n "$geoip_version" && "$geoip_version" != "null" ]]; then
         info "Downloading geoip.dat (${geoip_version})..."
@@ -219,7 +225,7 @@ download_geo_files() {
 
     # Get latest geosite release
     info "Fetching latest geosite version..."
-    local geosite_version=$(curl -fsSL "https://api.github.com/repos/v2fly/domain-list-community/releases/latest" | jq -r '.tag_name' 2>/dev/null)
+    local geosite_version=$(curl -fsSL "https://api.github.com/repos/v2fly/domain-list-community/releases/latest" | extract_tag_name 2>/dev/null)
     
     if [[ -n "$geosite_version" && "$geosite_version" != "null" ]]; then
         info "Downloading geosite.dat (${geosite_version})..."
@@ -568,7 +574,7 @@ update_geo() {
     
     # Get latest geoip release
     info "Fetching latest geoip version..."
-    GEOIP_LATEST=$(curl -fsSL "https://api.github.com/repos/v2fly/geoip/releases/latest" | jq -r '.tag_name' 2>/dev/null)
+    GEOIP_LATEST=$(curl -fsSL "https://api.github.com/repos/v2fly/geoip/releases/latest" | extract_tag_name 2>/dev/null)
     if [[ -n "$GEOIP_LATEST" && "$GEOIP_LATEST" != "null" ]]; then
         info "Latest geoip version: ${GEOIP_LATEST}"
         info "Downloading geoip.dat..."
@@ -583,7 +589,7 @@ update_geo() {
 
     # Get latest geosite release
     info "Fetching latest geosite version..."
-    GEOSITE_LATEST=$(curl -fsSL "https://api.github.com/repos/v2fly/domain-list-community/releases/latest" | jq -r '.tag_name' 2>/dev/null)
+    GEOSITE_LATEST=$(curl -fsSL "https://api.github.com/repos/v2fly/domain-list-community/releases/latest" | extract_tag_name 2>/dev/null)
     if [[ -n "$GEOSITE_LATEST" && "$GEOSITE_LATEST" != "null" ]]; then
         info "Latest geosite version: ${GEOSITE_LATEST}"
         info "Downloading geosite.dat..."
@@ -614,7 +620,7 @@ show_xray_version() {
     
     # Check latest Xray-core version on GitHub
     info "Fetching latest Xray-core version from GitHub..."
-    XRAY_LATEST=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name' 2>/dev/null)
+    XRAY_LATEST=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | extract_tag_name 2>/dev/null)
     if [[ -n "$XRAY_LATEST" && "$XRAY_LATEST" != "null" ]]; then
         echo -e "${CYAN}Latest Xray-core release: ${GREEN}${XRAY_LATEST}${NC}"
     else
