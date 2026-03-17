@@ -18,20 +18,45 @@ import (
 type InternalService struct {
 	logger           *zap.Logger
 	hashedSet        *hashedset.HashedSet
-	config           json.RawMessage
+	xrayConfig       json.RawMessage
 	disableHashCheck bool
 
-	// User-Inbound tracking: email -> set of inbound tags
+	// User-Inbound tracking: user -> set of inbound tags
 	userInboundMap map[string]map[string]struct{}
 	// Per-inbound hash sets for fine-grained change detection.
 	// Uses InboundHashedSet which replicates @remnawave/hashed-set (DJB2 dual XOR).
 	// The hash dynamically updates when users are added/removed via
 	// AddUserToInbound / RemoveUserFromInbound, matching Node.js behavior.
-	inboundHashSets map[string]*hashedset.InboundHashedSet
+	// Named to match Node.js: this.inboundsHashMap
+	inboundsHashMap map[string]*hashedset.InboundHashedSet
 	// Empty config hash (config without users)
 	emptyConfigHash string
 	// All known inbound tags (used for removing users from all inbounds)
 	xtlsConfigInbounds map[string]struct{}
+
+	// Stored user credentials for re-adding after Xray restart.
+	// Key: username (email), Value: StoredUser with full credentials
+	// This is needed because Panel sends empty clients[] in config and adds users dynamically.
+	// When Xray restarts, we need to re-add all these dynamic users.
+	storedUsers map[string]*StoredUser
+}
+
+// StoredUser holds user credentials for re-adding after Xray restart
+type StoredUser struct {
+	Username       string                  // email/userId used as unique identifier
+	HashUUID       string                  // vlessUuid used for hash tracking
+	VlessUUID      string                  // actual VLESS UUID
+	TrojanPassword string                  // Trojan password
+	SSPassword     string                  // Shadowsocks password
+	Inbounds       []StoredUserInboundData // inbound configurations
+}
+
+// StoredUserInboundData holds inbound-specific data for a stored user
+type StoredUserInboundData struct {
+	Tag        string // inbound tag
+	Type       string // "vless", "trojan", "shadowsocks"
+	Flow       string // for VLESS
+	CipherType int    // for Shadowsocks
 }
 
 // InternalConfig holds Internal service configuration
@@ -46,8 +71,9 @@ func NewInternalService(cfg *InternalConfig, logger *zap.Logger) *InternalServic
 		hashedSet:          hashedset.New(),
 		disableHashCheck:   cfg.DisableHashCheck,
 		userInboundMap:     make(map[string]map[string]struct{}),
-		inboundHashSets:    make(map[string]*hashedset.InboundHashedSet),
+		inboundsHashMap:    make(map[string]*hashedset.InboundHashedSet),
 		xtlsConfigInbounds: make(map[string]struct{}),
+		storedUsers:        make(map[string]*StoredUser),
 	}
 }
 
@@ -62,21 +88,69 @@ func (s *InternalService) GetXtlsConfigInbounds() []string {
 }
 
 // AddXtlsConfigInbound adds an inbound tag to the known set
-func (s *InternalService) AddXtlsConfigInbound(tag string) {
+// Matches Node.js: addXtlsConfigInbound(inboundTag)
+func (s *InternalService) AddXtlsConfigInbound(inboundTag string) {
 
-	s.xtlsConfigInbounds[tag] = struct{}{}
+	s.xtlsConfigInbounds[inboundTag] = struct{}{}
 }
 
-// Cleanup clears all internal state (called when Xray stops)
+// Cleanup clears internal state (called when Xray stops)
+// Matches Node.js: cleanup()
+// NOTE: storedUsers is NOT cleared here - it's needed to re-add users after restart.
+// Call ClearStoredUsers() explicitly if you want to clear all users.
 func (s *InternalService) Cleanup() {
 
-	s.logger.Info("Cleaning up internal service state")
+	s.logger.Info("Cleaning up internal service.")
 
-	s.userInboundMap = make(map[string]map[string]struct{})
-	s.inboundHashSets = make(map[string]*hashedset.InboundHashedSet)
+	s.inboundsHashMap = make(map[string]*hashedset.InboundHashedSet)
 	s.xtlsConfigInbounds = make(map[string]struct{})
-	s.config = nil
+	s.xrayConfig = nil
 	s.emptyConfigHash = ""
+
+	// Go-specific: also clear userInboundMap
+	s.userInboundMap = make(map[string]map[string]struct{})
+
+	// NOTE: storedUsers is intentionally NOT cleared - needed for restart
+}
+
+// StoreUser saves user credentials for re-adding after Xray restart
+func (s *InternalService) StoreUser(user *StoredUser) {
+	if user == nil || user.Username == "" {
+		return
+	}
+	s.storedUsers[user.Username] = user
+	s.logger.Debug("Stored user credentials for restart recovery",
+		zap.String("username", user.Username),
+		zap.Int("inboundCount", len(user.Inbounds)))
+}
+
+// RemoveStoredUser removes a user from stored credentials
+func (s *InternalService) RemoveStoredUser(username string) {
+	if _, exists := s.storedUsers[username]; exists {
+		delete(s.storedUsers, username)
+		s.logger.Debug("Removed stored user credentials",
+			zap.String("username", username))
+	}
+}
+
+// GetAllStoredUsers returns all stored users for re-adding after restart
+func (s *InternalService) GetAllStoredUsers() []*StoredUser {
+	result := make([]*StoredUser, 0, len(s.storedUsers))
+	for _, user := range s.storedUsers {
+		result = append(result, user)
+	}
+	return result
+}
+
+// GetStoredUsersCount returns the count of stored users
+func (s *InternalService) GetStoredUsersCount() int {
+	return len(s.storedUsers)
+}
+
+// ClearStoredUsers clears all stored user credentials (use when doing full cleanup)
+func (s *InternalService) ClearStoredUsers() {
+	s.storedUsers = make(map[string]*StoredUser)
+	s.logger.Info("Cleared all stored user credentials")
 }
 
 // GetUserInbounds returns all inbound tags that a user belongs to
@@ -96,80 +170,65 @@ func (s *InternalService) GetUserInbounds(email string) []string {
 
 // AddUserToInbound records that a user belongs to an inbound.
 // Also adds the user to the InboundHashedSet so the DJB2 hash stays in sync.
-// This matches Node.js: usersSet.add(user)
-func (s *InternalService) AddUserToInbound(email, tag string) {
+// Matches Node.js: addUserToInbound(inboundTag, user)
+func (s *InternalService) AddUserToInbound(inboundTag, user string) {
 
-	if s.userInboundMap[email] == nil {
-		s.userInboundMap[email] = make(map[string]struct{})
+	if s.userInboundMap[user] == nil {
+		s.userInboundMap[user] = make(map[string]struct{})
 	}
-	s.userInboundMap[email][tag] = struct{}{}
+	s.userInboundMap[user][inboundTag] = struct{}{}
 
 	// Update the InboundHashedSet for this inbound
-	hs, exists := s.inboundHashSets[tag]
+	hs, exists := s.inboundsHashMap[inboundTag]
 	if !exists {
 		// Inbound not yet tracked — create a new InboundHashedSet
-		s.logger.Warn("Inbound not found in inboundHashSets, creating new one",
-			zap.String("tag", tag))
+		s.logger.Warn("Inbound not found in inboundsHashMap, creating new one",
+			zap.String("tag", inboundTag))
 		hs = hashedset.NewInboundHashedSet()
-		s.inboundHashSets[tag] = hs
+		s.inboundsHashMap[inboundTag] = hs
 	}
-	hs.Add(email)
+	hs.Add(user)
+
+	// Ensure the inbound is also registered in xtlsConfigInbounds.
+	// This is critical: RemoveUserFromInbound deletes the tag from xtlsConfigInbounds
+	// when the last user is removed. If a new user is subsequently added to the same
+	// inbound (e.g., in an AddUsers loop), the tag must be restored so that later
+	// iterations of GetXtlsConfigInbounds() still see this inbound.
+	s.xtlsConfigInbounds[inboundTag] = struct{}{}
 }
 
 // RemoveUserFromInbound removes a user from an inbound tracking.
 // Also removes the user from the InboundHashedSet so the DJB2 hash stays in sync.
 // When the inbound has no remaining users, also cleans up xtlsConfigInbounds and
-// inboundHashSets (matches Node.js behavior where both inboundsHashMap and
+// inboundsHashMap (matches Node.js behavior where both inboundsHashMap and
 // xtlsConfigInbounds are cleared when usersSet.size === 0).
-func (s *InternalService) RemoveUserFromInbound(email, tag string) {
-
-	if tags, exists := s.userInboundMap[email]; exists {
-		delete(tags, tag)
-		// Clean up if no more inbounds for this user
-		if len(tags) == 0 {
-			delete(s.userInboundMap, email)
-		}
-	}
+// Matches Node.js: removeUserFromInbound(inboundTag, user)
+func (s *InternalService) RemoveUserFromInbound(inboundTag, user string) {
 
 	// Update the InboundHashedSet — matches Node.js: usersSet.delete(user)
-	if hs, exists := s.inboundHashSets[tag]; exists {
-		hs.Delete(email)
+	hs, exists := s.inboundsHashMap[inboundTag]
+	if !exists {
+		// Matches Node.js: if (!usersSet) return;
+		return
 	}
+	hs.Delete(user)
 
-	// Check if the inbound now has zero users — if so, clean up
-	// (matches Node.js: xtlsConfigInbounds.delete + inboundsHashMap.delete when size === 0)
-	if s.isInboundEmpty(tag) {
-		delete(s.xtlsConfigInbounds, tag)
-		delete(s.inboundHashSets, tag)
-		s.logger.Warn("Inbound has no users, clearing from tracking",
-			zap.String("tag", tag))
-	}
-}
-
-// isInboundEmpty checks if any user still belongs to the given inbound tag
-func (s *InternalService) isInboundEmpty(tag string) bool {
-	for _, tags := range s.userInboundMap {
-		if _, exists := tags[tag]; exists {
-			return false
+	// Also update userInboundMap for internal tracking
+	if tags, exists := s.userInboundMap[user]; exists {
+		delete(tags, inboundTag)
+		if len(tags) == 0 {
+			delete(s.userInboundMap, user)
 		}
 	}
-	return true
-}
 
-// RemoveUserFromAllInbounds removes a user from all inbound tracking
-func (s *InternalService) RemoveUserFromAllInbounds(email string) []string {
-
-	tags, exists := s.userInboundMap[email]
-	if !exists {
-		return nil
+	// Check if the inbound now has zero users using InboundHashedSet.Size()
+	// This matches Node.js: if (usersSet.size === 0) { ... }
+	if hs.Size() == 0 {
+		delete(s.xtlsConfigInbounds, inboundTag)
+		delete(s.inboundsHashMap, inboundTag)
+		s.logger.Warn("Inbound has no users, clearing inboundsHashMap.",
+			zap.String("tag", inboundTag))
 	}
-
-	result := make([]string, 0, len(tags))
-	for tag := range tags {
-		result = append(result, tag)
-	}
-	delete(s.userInboundMap, email)
-	return result
 }
 
 // GetUsersInInbound returns all user emails in a specific inbound
@@ -214,17 +273,21 @@ type XrayConfigParsed struct {
 
 // ExtractUsersFromConfig parses config and builds user-inbound mapping
 // Also stores the incoming hashes for later comparison
-func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes *InboundHashes) error {
+// Matches Node.js: extractUsersFromConfig(hashes, newConfig)
+func (s *InternalService) ExtractUsersFromConfig(hashes *InboundHashes, newConfig json.RawMessage) error {
 
 	var parsed XrayConfigParsed
-	if err := json.Unmarshal(config, &parsed); err != nil {
+	if err := json.Unmarshal(newConfig, &parsed); err != nil {
 		return err
 	}
 
-	// Clear existing mappings
+	// Clear existing mappings (matches Node.js: this.cleanup())
 	s.userInboundMap = make(map[string]map[string]struct{})
-	s.inboundHashSets = make(map[string]*hashedset.InboundHashedSet)
+	s.inboundsHashMap = make(map[string]*hashedset.InboundHashedSet)
 	s.xtlsConfigInbounds = make(map[string]struct{})
+
+	// Store the config (matches Node.js: this.xrayConfig = newConfig)
+	s.xrayConfig = newConfig
 
 	// Build valid tags set from incoming hashes
 	validTags := make(map[string]string) // tag -> hash
@@ -236,30 +299,33 @@ func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes 
 	}
 
 	for _, inbound := range parsed.Inbounds {
-		if inbound.Tag == "" {
+		inboundTag := inbound.Tag
+
+		if inboundTag == "" {
 			continue
 		}
 
 		// Only process inbounds that are in the valid tags (from hashes)
-		_, isValid := validTags[inbound.Tag]
+		// Matches Node.js: if (!inboundTag || !validTags.has(inboundTag)) return;
+		_, isValid := validTags[inboundTag]
 		if hashes != nil && !isValid {
 			continue
 		}
 
-		// Add to known inbounds set
-		s.xtlsConfigInbounds[inbound.Tag] = struct{}{}
+		// Matches Node.js: const usersSet = new HashedSet();
+		usersSet := hashedset.NewInboundHashedSet()
 
-		// Create InboundHashedSet for this inbound, populated from client IDs.
-		// This matches Node.js behavior: the HashedSet contains client.id values
-		// and dynamically computes a DJB2 dual XOR hash (hash64String).
-		// When users are added/removed later, the hash updates automatically.
-		hs := hashedset.NewInboundHashedSet()
-		s.inboundHashSets[inbound.Tag] = hs
+		// Matches Node.js: if (inbound.settings?.clients) for (client of clients) usersSet.add(client.id)
+		for _, client := range inbound.Settings.Clients {
+			if client.ID != "" {
+				usersSet.Add(client.ID)
+			}
+		}
 
-		// Map users to this inbound and populate the InboundHashedSet
-		// Node.js uses client.id (UUID) as the tracking key in its HashedSet.
-		// handler.go also uses hashData.vlessUuid when calling AddUserToInbound.
-		// We use client.ID (UUID) when available, falling back to client.Email.
+		// Matches Node.js: this.inboundsHashMap.set(inboundTag, usersSet)
+		s.inboundsHashMap[inboundTag] = usersSet
+
+		// Also populate userInboundMap for internal tracking (Go-specific, needed for GetUsersInInbound)
 		for _, client := range inbound.Settings.Clients {
 			trackingKey := client.ID
 			if trackingKey == "" {
@@ -271,21 +337,17 @@ func (s *InternalService) ExtractUsersFromConfig(config json.RawMessage, hashes 
 			if s.userInboundMap[trackingKey] == nil {
 				s.userInboundMap[trackingKey] = make(map[string]struct{})
 			}
-			s.userInboundMap[trackingKey][inbound.Tag] = struct{}{}
-			// Add to the InboundHashedSet — hash updates via DJB2 XOR
-			hs.Add(trackingKey)
+			s.userInboundMap[trackingKey][inboundTag] = struct{}{}
 		}
-
-		// Log each inbound with user count (INFO level for visibility)
-		s.logger.Info("Loaded inbound from config",
-			zap.String("tag", inbound.Tag),
-			zap.Int("users", len(inbound.Settings.Clients)),
-			zap.String("hash", hs.Hash64String()))
 	}
 
-	s.logger.Info("Extracted users from config",
-		zap.Int("inbounds", len(s.xtlsConfigInbounds)),
-		zap.Int("totalUsers", len(s.userInboundMap)))
+	// Matches Node.js: for (const [inboundTag, usersSet] of this.inboundsHashMap) { xtlsConfigInbounds.add(inboundTag); }
+	for inboundTag, usersSet := range s.inboundsHashMap {
+		s.xtlsConfigInbounds[inboundTag] = struct{}{}
+		s.logger.Info("Inbound loaded",
+			zap.String("tag", inboundTag),
+			zap.Int("users", usersSet.Size()))
+	}
 
 	return nil
 }
@@ -320,7 +382,8 @@ func (h *InboundHashes) InboundsCount() int {
 }
 
 // IsNeedRestartCore checks if core restart is needed by comparing hashes
-func (s *InternalService) IsNeedRestartCore(hashes *InboundHashes) bool {
+// Matches Node.js: isNeedRestartCore(incomingHashes)
+func (s *InternalService) IsNeedRestartCore(incomingHashes *InboundHashes) bool {
 
 	if s.disableHashCheck {
 		return true
@@ -328,54 +391,43 @@ func (s *InternalService) IsNeedRestartCore(hashes *InboundHashes) bool {
 
 	// If no stored hash, need restart
 	if s.emptyConfigHash == "" {
-		s.logger.Debug("No stored config hash, need restart")
 		return true
 	}
 
 	// Compare empty config hash
-	if s.emptyConfigHash != hashes.EmptyConfig {
-		s.logger.Warn("Detected changes in Xray Core base configuration",
-			zap.String("current", s.emptyConfigHash),
-			zap.String("new", hashes.EmptyConfig))
+	if incomingHashes.EmptyConfig != s.emptyConfigHash {
+		s.logger.Warn("Detected changes in Xray Core base configuration")
 		return true
 	}
 
 	// Compare number of inbounds
-	if len(hashes.Inbounds) != len(s.inboundHashSets) {
-		s.logger.Warn("Number of Xray Core inbounds has changed",
-			zap.Int("current", len(s.inboundHashSets)),
-			zap.Int("new", len(hashes.Inbounds)))
+	if len(incomingHashes.Inbounds) != len(s.inboundsHashMap) {
+		s.logger.Warn("Number of Xray Core inbounds has changed")
 		return true
 	}
 
-	// Compare per-inbound hashes (using array format).
-	// The local InboundHashedSet computes hash64String via DJB2 dual XOR,
-	// matching the panel's @remnawave/hashed-set algorithm.
-	for _, item := range hashes.Inbounds {
-		hs, exists := s.inboundHashSets[item.Tag]
-		if !exists {
-			s.logger.Warn("New inbound detected", zap.String("tag", item.Tag))
-			return true
+	// Compare per-inbound hashes — iterate stored inboundsHashMap, find in incoming
+	// Matches Node.js: for (const [inboundTag, usersSet] of this.inboundsHashMap)
+	for inboundTag, usersSet := range s.inboundsHashMap {
+		var incomingInbound *InboundHashItem
+		for i := range incomingHashes.Inbounds {
+			if incomingHashes.Inbounds[i].Tag == inboundTag {
+				incomingInbound = &incomingHashes.Inbounds[i]
+				break
+			}
 		}
-		currentHash := hs.Hash64String()
-		if currentHash != item.Hash {
-			s.logger.Warn("User configuration changed for inbound",
-				zap.String("tag", item.Tag),
-				zap.String("current", currentHash),
-				zap.String("new", item.Hash))
-			return true
-		}
-	}
 
-	// Check if any existing inbounds were removed
-	// Build a set of incoming tags for quick lookup
-	incomingTags := make(map[string]struct{}, len(hashes.Inbounds))
-	for _, item := range hashes.Inbounds {
-		incomingTags[item.Tag] = struct{}{}
-	}
-	for tag := range s.inboundHashSets {
-		if _, exists := incomingTags[tag]; !exists {
-			s.logger.Warn("Inbound no longer exists", zap.String("tag", tag))
+		if incomingInbound == nil {
+			s.logger.Warn("Inbound no longer exists in Xray Core configuration",
+				zap.String("tag", inboundTag))
+			return true
+		}
+
+		if usersSet.Hash64String() != incomingInbound.Hash {
+			s.logger.Warn("User configuration changed for inbound",
+				zap.String("tag", inboundTag),
+				zap.String("current", usersSet.Hash64String()),
+				zap.String("new", incomingInbound.Hash))
 			return true
 		}
 	}
@@ -388,9 +440,9 @@ func (s *InternalService) IsNeedRestartCore(hashes *InboundHashes) bool {
 // dynamically maintained via Add/Delete. This method is kept for interface compatibility.
 func (s *InternalService) UpdateInboundHash(tag string, data json.RawMessage) (bool, error) {
 
-	_, exists := s.inboundHashSets[tag]
+	_, exists := s.inboundsHashMap[tag]
 	if !exists {
-		s.inboundHashSets[tag] = hashedset.NewInboundHashedSet()
+		s.inboundsHashMap[tag] = hashedset.NewInboundHashedSet()
 	}
 	// With InboundHashedSet, the hash is automatically computed from members.
 	// There's nothing to "update" from external data — return false (no change).
@@ -412,8 +464,8 @@ func (s *InternalService) GetEmptyConfigHash() string {
 // GetInboundHashes returns all current hashes
 func (s *InternalService) GetInboundHashes() *InboundHashes {
 
-	inbounds := make([]InboundHashItem, 0, len(s.inboundHashSets))
-	for tag, hs := range s.inboundHashSets {
+	inbounds := make([]InboundHashItem, 0, len(s.inboundsHashMap))
+	for tag, hs := range s.inboundsHashMap {
 		inbounds = append(inbounds, InboundHashItem{
 			Tag:  tag,
 			Hash: hs.Hash64String(),
@@ -443,7 +495,7 @@ func (s *InternalService) GetConfig() *GetConfigResponse {
 
 	hash, _ := s.hashedSet.GetHash("config")
 	return &GetConfigResponse{
-		Config:     s.config,
+		Config:     s.xrayConfig,
 		ConfigHash: hash,
 	}
 }
@@ -474,7 +526,7 @@ func (s *InternalService) SetConfig(req *SetConfigRequest) *SetConfigResponse {
 	}
 
 	if changed || s.disableHashCheck {
-		s.config = req.Config
+		s.xrayConfig = req.Config
 		s.logger.Debug("Config updated", zap.Bool("changed", changed))
 	}
 

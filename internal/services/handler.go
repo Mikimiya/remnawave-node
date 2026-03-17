@@ -4,6 +4,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -129,8 +130,42 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 		return &AddUserResponse{Success: false, Error: &errMsg}, nil
 	}
 
+	// Validate hashData
+	if req.HashData.VlessUUID == "" {
+		errMsg := "hashData.vlessUuid is required"
+		s.logger.Error("AddUser: validation failed", zap.String("error", errMsg))
+		return &AddUserResponse{Success: false, Error: &errMsg}, nil
+	}
+
+	// Validate each item in data array
+	for i, item := range req.Data {
+		if item.Type == "" {
+			errMsg := fmt.Sprintf("data[%d].type is empty - request may be malformed", i)
+			s.logger.Error("AddUser: validation failed",
+				zap.String("error", errMsg),
+				zap.Any("item", item))
+			return &AddUserResponse{Success: false, Error: &errMsg}, nil
+		}
+		if item.Tag == "" {
+			errMsg := fmt.Sprintf("data[%d].tag is empty", i)
+			s.logger.Error("AddUser: validation failed", zap.String("error", errMsg))
+			return &AddUserResponse{Success: false, Error: &errMsg}, nil
+		}
+		if item.Username == "" {
+			errMsg := fmt.Sprintf("data[%d].username is empty", i)
+			s.logger.Error("AddUser: validation failed", zap.String("error", errMsg))
+			return &AddUserResponse{Success: false, Error: &errMsg}, nil
+		}
+	}
+
 	// Get username from first item (all items have same username)
 	username := req.Data[0].Username
+
+	s.logger.Info("AddUser: starting",
+		zap.String("username", username),
+		zap.String("vlessUuid", req.HashData.VlessUUID),
+		zap.String("prevVlessUuid", req.HashData.PrevVlessUUID),
+		zap.Int("inboundCount", len(req.Data)))
 
 	// Step 1: Add all target inbounds to known inbounds
 	for _, item := range req.Data {
@@ -139,6 +174,10 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 
 	// Step 2: Remove user from ALL known inbounds first (like Node.js does)
 	allTags := s.internal.GetXtlsConfigInbounds()
+	s.logger.Debug("AddUser: removing from all known inbounds",
+		zap.String("username", username),
+		zap.Strings("allTags", allTags))
+
 	for _, tag := range allTags {
 		s.logger.Debug("Removing user from inbound before adding",
 			zap.String("username", username),
@@ -148,9 +187,9 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 
 		// Also remove prevVlessUuid user if exists
 		if req.HashData.PrevVlessUUID != "" {
-			s.internal.RemoveUserFromInbound(req.HashData.PrevVlessUUID, tag)
+			s.internal.RemoveUserFromInbound(tag, req.HashData.PrevVlessUUID)
 		} else {
-			s.internal.RemoveUserFromInbound(req.HashData.VlessUUID, tag)
+			s.internal.RemoveUserFromInbound(tag, req.HashData.VlessUUID)
 		}
 	}
 
@@ -190,15 +229,25 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 		}
 
 		if err != nil {
-			s.logger.Error("Failed to add user",
-				zap.String("username", item.Username),
-				zap.String("tag", item.Tag),
-				zap.String("type", item.Type),
-				zap.Error(err))
-			lastError = err
+			// Match Node.js xtls-sdk behavior: "already exists" is treated as success (isOk: true).
+			// The user IS in xray-core, so tracking must still be updated.
+			if strings.Contains(err.Error(), "already exists") {
+				s.logger.Info("User already exists in inbound (treating as success)",
+					zap.String("username", item.Username),
+					zap.String("tag", item.Tag))
+				s.internal.AddUserToInbound(item.Tag, req.HashData.VlessUUID)
+				successCount++
+			} else {
+				s.logger.Error("Failed to add user",
+					zap.String("username", item.Username),
+					zap.String("tag", item.Tag),
+					zap.String("type", item.Type),
+					zap.Error(err))
+				lastError = err
+			}
 		} else {
 			// Update tracking on success
-			s.internal.AddUserToInbound(req.HashData.VlessUUID, item.Tag)
+			s.internal.AddUserToInbound(item.Tag, req.HashData.VlessUUID)
 			successCount++
 
 			s.logger.Info("Added user",
@@ -210,6 +259,35 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 
 	// Return success if at least one user was added
 	if successCount > 0 {
+		// Store user credentials for re-adding after Xray restart
+		storedUser := &StoredUser{
+			Username:  username,
+			HashUUID:  req.HashData.VlessUUID,
+			VlessUUID: "", // will be set per-inbound below
+		}
+
+		// Build inbound list from successful adds
+		for _, item := range req.Data {
+			inbound := StoredUserInboundData{
+				Tag:        item.Tag,
+				Type:       item.Type,
+				Flow:       item.Flow,
+				CipherType: int(item.CipherType),
+			}
+			storedUser.Inbounds = append(storedUser.Inbounds, inbound)
+
+			// Extract credentials based on type
+			switch item.Type {
+			case "vless":
+				storedUser.VlessUUID = item.UUID
+			case "trojan":
+				storedUser.TrojanPassword = item.Password
+			case "shadowsocks":
+				storedUser.SSPassword = item.Password
+			}
+		}
+
+		s.internal.StoreUser(storedUser)
 		return &AddUserResponse{Success: true, Error: nil}, nil
 	}
 
@@ -286,6 +364,46 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 		return &AddUsersResponse{Success: false, Error: &errMsg}, nil
 	}
 
+	// Validate request
+	if len(req.Users) == 0 {
+		s.logger.Warn("AddUsers: no users in request")
+		return &AddUsersResponse{Success: true, Error: nil}, nil
+	}
+
+	// Validate each user has required fields
+	for i, user := range req.Users {
+		if user.UserData.UserId == "" {
+			errMsg := fmt.Sprintf("users[%d].userData.userId is empty", i)
+			s.logger.Error("AddUsers: validation failed", zap.String("error", errMsg))
+			return &AddUsersResponse{Success: false, Error: &errMsg}, nil
+		}
+		if user.UserData.VlessUuid == "" {
+			errMsg := fmt.Sprintf("users[%d].userData.vlessUuid is empty", i)
+			s.logger.Error("AddUsers: validation failed", zap.String("error", errMsg))
+			return &AddUsersResponse{Success: false, Error: &errMsg}, nil
+		}
+		if len(user.InboundData) == 0 {
+			s.logger.Warn("AddUsers: user has no inboundData, will be skipped",
+				zap.String("userId", user.UserData.UserId),
+				zap.Int("index", i))
+		}
+		for j, item := range user.InboundData {
+			if item.Type == "" {
+				errMsg := fmt.Sprintf("users[%d].inboundData[%d].type is empty - request may be malformed", i, j)
+				s.logger.Error("AddUsers: validation failed",
+					zap.String("error", errMsg),
+					zap.String("userId", user.UserData.UserId),
+					zap.Any("inboundData", item))
+				return &AddUsersResponse{Success: false, Error: &errMsg}, nil
+			}
+			if item.Tag == "" {
+				errMsg := fmt.Sprintf("users[%d].inboundData[%d].tag is empty", i, j)
+				s.logger.Error("AddUsers: validation failed", zap.String("error", errMsg))
+				return &AddUsersResponse{Success: false, Error: &errMsg}, nil
+			}
+		}
+	}
+
 	// Add affected inbound tags to known inbounds
 	for _, tag := range req.AffectedInboundTags {
 		s.internal.AddXtlsConfigInbound(tag)
@@ -295,12 +413,20 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 		zap.Int("users", len(req.Users)),
 		zap.Strings("inbounds", req.AffectedInboundTags))
 
-	for _, user := range req.Users {
+	for i, user := range req.Users {
 		// Step 1: Remove user from ALL known inbounds first
 		allTags := s.internal.GetXtlsConfigInbounds()
+
+		s.logger.Debug("AddUsers: processing user",
+			zap.Int("index", i),
+			zap.String("userId", user.UserData.UserId),
+			zap.String("hashUuid", user.UserData.HashUuid),
+			zap.String("vlessUuid", user.UserData.VlessUuid),
+			zap.Int("inboundDataCount", len(user.InboundData)),
+			zap.Strings("knownInbounds", allTags))
 		for _, tag := range allTags {
 			_ = s.removeUserFromInbound(ctx, tag, user.UserData.UserId)
-			s.internal.RemoveUserFromInbound(user.UserData.HashUuid, tag)
+			s.internal.RemoveUserFromInbound(tag, user.UserData.HashUuid)
 		}
 
 		// Step 2: Add user to each inbound based on type
@@ -350,17 +476,47 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 			}
 
 			if err != nil {
-				s.logger.Warn("Failed to add user",
-					zap.String("userId", user.UserData.UserId),
-					zap.String("tag", item.Tag),
-					zap.Error(err))
+				// Match Node.js xtls-sdk behavior: "already exists" is treated as success (isOk: true).
+				// The user IS in xray-core, so tracking must still be updated.
+				if strings.Contains(err.Error(), "already exists") {
+					s.logger.Info("User already exists in inbound (treating as success)",
+						zap.String("userId", user.UserData.UserId),
+						zap.String("tag", item.Tag))
+					s.internal.AddUserToInbound(item.Tag, user.UserData.VlessUuid)
+				} else {
+					s.logger.Warn("Failed to add user",
+						zap.String("userId", user.UserData.UserId),
+						zap.String("tag", item.Tag),
+						zap.Error(err))
+				}
 			} else {
-				s.internal.AddUserToInbound(user.UserData.VlessUuid, item.Tag)
+				s.internal.AddUserToInbound(item.Tag, user.UserData.VlessUuid)
 				s.logger.Debug("Added user",
 					zap.String("userId", user.UserData.UserId),
 					zap.String("tag", item.Tag))
 			}
 		}
+
+		// Store user credentials for re-adding after Xray restart
+		storedUser := &StoredUser{
+			Username:       user.UserData.UserId,
+			HashUUID:       user.UserData.HashUuid,
+			VlessUUID:      user.UserData.VlessUuid,
+			TrojanPassword: user.UserData.TrojanPassword,
+			SSPassword:     user.UserData.SsPassword,
+		}
+		for _, item := range user.InboundData {
+			inbound := StoredUserInboundData{
+				Tag:  item.Tag,
+				Type: item.Type,
+				Flow: item.Flow,
+			}
+			if item.Type == "shadowsocks" {
+				inbound.CipherType = 7 // chacha20-poly1305 default
+			}
+			storedUser.Inbounds = append(storedUser.Inbounds, inbound)
+		}
+		s.internal.StoreUser(storedUser)
 	}
 
 	s.logger.Info("Batch add users completed", zap.Int("users", len(req.Users)))
@@ -413,18 +569,26 @@ func (s *HandlerService) RemoveUser(ctx context.Context, req *RemoveUserRequest)
 			zap.String("tag", tag))
 
 		if err := s.xrayCore.RemoveUser(ctx, tag, req.Username); err != nil {
-			failCount++
-			lastError = err
+			// Match Node.js xtls-sdk behavior: "not found" is treated as success (isOk: true)
+			if strings.Contains(err.Error(), "not found") {
+				successCount++
+			} else {
+				failCount++
+				lastError = err
+			}
 		} else {
 			successCount++
 		}
-		s.internal.RemoveUserFromInbound(req.HashData.VlessUUID, tag)
+		s.internal.RemoveUserFromInbound(tag, req.HashData.VlessUUID)
 	}
 
 	s.logger.Info("Removed user from all inbounds",
 		zap.String("username", req.Username),
 		zap.Int("success", successCount),
 		zap.Int("failed", failCount))
+
+	// Also remove from stored users so they don't get re-added on restart
+	s.internal.RemoveStoredUser(req.Username)
 
 	// If ALL operations failed, return error (matches Node.js behavior)
 	if successCount == 0 && failCount > 0 {
@@ -488,13 +652,21 @@ func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersReques
 				zap.String("tag", tag))
 
 			if err := s.xrayCore.RemoveUser(ctx, tag, user.UserId); err != nil {
-				failCount++
-				lastError = err
+				// Match Node.js xtls-sdk behavior: "not found" is treated as success (isOk: true)
+				if strings.Contains(err.Error(), "not found") {
+					successCount++
+				} else {
+					failCount++
+					lastError = err
+				}
 			} else {
 				successCount++
 			}
-			s.internal.RemoveUserFromInbound(user.HashUuid, tag)
+			s.internal.RemoveUserFromInbound(tag, user.HashUuid)
 		}
+
+		// Also remove from stored users so they don't get re-added on restart
+		s.internal.RemoveStoredUser(user.UserId)
 	}
 
 	s.logger.Info("Batch remove users completed",

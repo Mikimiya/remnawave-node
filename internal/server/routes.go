@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -99,7 +100,12 @@ func (s *Server) handleXrayStart(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.xrayService.Start(c.Request.Context(), &req)
+	// Use context.Background() so xray operations are NOT cancelled when the HTTP
+	// connection is closed. This is critical: large batch operations (like AddUsers
+	// with hundreds of users) may take longer than the HTTP timeout. If we used
+	// c.Request.Context(), a timeout would cancel xray-core operations mid-batch,
+	// leaving some users added and others silently dropped.
+	resp, err := s.xrayService.Start(context.Background(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -110,7 +116,7 @@ func (s *Server) handleXrayStart(c *gin.Context) {
 }
 
 func (s *Server) handleXrayStop(c *gin.Context) {
-	resp, err := s.xrayService.Stop(c.Request.Context())
+	resp, err := s.xrayService.Stop(context.Background())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -122,7 +128,7 @@ func (s *Server) handleXrayStop(c *gin.Context) {
 }
 
 func (s *Server) handleXrayStatus(c *gin.Context) {
-	resp, err := s.xrayService.GetStatus(c.Request.Context())
+	resp, err := s.xrayService.GetStatus(context.Background())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -134,7 +140,7 @@ func (s *Server) handleXrayStatus(c *gin.Context) {
 }
 
 func (s *Server) handleNodeHealthCheck(c *gin.Context) {
-	resp := s.xrayService.GetNodeHealthCheck(c.Request.Context())
+	resp := s.xrayService.GetNodeHealthCheck(context.Background())
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -149,7 +155,7 @@ func (s *Server) handleGetUserOnlineStatus(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.statsService.GetUserOnlineStatus(c.Request.Context(), &services.GetUserOnlineStatusRequest{
+	resp, err := s.statsService.GetUserOnlineStatus(context.Background(), &services.GetUserOnlineStatusRequest{
 		Email: req.Username,
 	})
 	if err != nil {
@@ -171,7 +177,7 @@ func (s *Server) handleGetUsersStats(c *gin.Context) {
 		req.Reset = false
 	}
 
-	resp, err := s.statsService.GetAllUsersStats(c.Request.Context(), &services.GetAllUsersStatsRequest{
+	resp, err := s.statsService.GetAllUsersStats(context.Background(), &services.GetAllUsersStatsRequest{
 		Reset: req.Reset,
 	})
 	if err != nil {
@@ -185,7 +191,7 @@ func (s *Server) handleGetUsersStats(c *gin.Context) {
 }
 
 func (s *Server) handleGetSystemStats(c *gin.Context) {
-	resp, err := s.statsService.GetSystemStats(c.Request.Context())
+	resp, err := s.statsService.GetSystemStats(context.Background())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -206,7 +212,7 @@ func (s *Server) handleGetInboundStats(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.statsService.GetInboundStats(c.Request.Context(), &services.GetInboundStatsRequest{
+	resp, err := s.statsService.GetInboundStats(context.Background(), &services.GetInboundStatsRequest{
 		Tag:   req.Tag,
 		Reset: req.Reset,
 	})
@@ -230,7 +236,7 @@ func (s *Server) handleGetOutboundStats(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.statsService.GetOutboundStats(c.Request.Context(), &services.GetOutboundStatsRequest{
+	resp, err := s.statsService.GetOutboundStats(context.Background(), &services.GetOutboundStatsRequest{
 		Tag:   req.Tag,
 		Reset: req.Reset,
 	})
@@ -252,7 +258,7 @@ func (s *Server) handleGetAllInboundsStats(c *gin.Context) {
 		req.Reset = false
 	}
 
-	resp, err := s.statsService.GetAllInboundsStats(c.Request.Context(), &services.GetAllInboundsStatsRequest{
+	resp, err := s.statsService.GetAllInboundsStats(context.Background(), &services.GetAllInboundsStatsRequest{
 		Reset: req.Reset,
 	})
 	if err != nil {
@@ -273,7 +279,7 @@ func (s *Server) handleGetAllOutboundsStats(c *gin.Context) {
 		req.Reset = false
 	}
 
-	resp, err := s.statsService.GetAllOutboundsStats(c.Request.Context(), &services.GetAllOutboundsStatsRequest{
+	resp, err := s.statsService.GetAllOutboundsStats(context.Background(), &services.GetAllOutboundsStatsRequest{
 		Reset: req.Reset,
 	})
 	if err != nil {
@@ -294,7 +300,7 @@ func (s *Server) handleGetCombinedStats(c *gin.Context) {
 		req.Reset = false
 	}
 
-	resp, err := s.statsService.GetCombinedStats(c.Request.Context(), &services.GetCombinedStatsRequest{
+	resp, err := s.statsService.GetCombinedStats(context.Background(), &services.GetCombinedStatsRequest{
 		Reset: req.Reset,
 	})
 	if err != nil {
@@ -316,7 +322,7 @@ func (s *Server) handleAddUser(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.handlerService.AddUser(c.Request.Context(), &req)
+	resp, err := s.handlerService.AddUser(context.Background(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -334,7 +340,7 @@ func (s *Server) handleAddUsers(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.handlerService.AddUsers(c.Request.Context(), &req)
+	resp, err := s.handlerService.AddUsers(context.Background(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -352,7 +358,7 @@ func (s *Server) handleRemoveUser(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.handlerService.RemoveUser(c.Request.Context(), &req)
+	resp, err := s.handlerService.RemoveUser(context.Background(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -370,7 +376,7 @@ func (s *Server) handleRemoveUsers(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.handlerService.RemoveUsers(c.Request.Context(), &req)
+	resp, err := s.handlerService.RemoveUsers(context.Background(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -390,7 +396,7 @@ func (s *Server) handleGetInboundUsersCount(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.handlerService.GetInboundUsersCount(c.Request.Context(), req.Tag)
+	resp, err := s.handlerService.GetInboundUsersCount(context.Background(), req.Tag)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -410,7 +416,7 @@ func (s *Server) handleGetInboundUsers(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.handlerService.GetInboundUsers(c.Request.Context(), req.Tag)
+	resp, err := s.handlerService.GetInboundUsers(context.Background(), req.Tag)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -430,7 +436,7 @@ func (s *Server) handleBlockIP(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.visionService.BlockIP(c.Request.Context(), &req)
+	resp, err := s.visionService.BlockIP(context.Background(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -448,7 +454,7 @@ func (s *Server) handleUnblockIP(c *gin.Context) {
 		return
 	}
 
-	resp, err := s.visionService.UnblockIP(c.Request.Context(), &req)
+	resp, err := s.visionService.UnblockIP(context.Background(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

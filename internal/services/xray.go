@@ -34,6 +34,9 @@ type XrayService struct {
 
 	// Port mapping for NAT machines
 	portMap map[int]int
+
+	// Concurrent request guard (matches Node.js isXrayStartedProcessing)
+	isStartProcessing bool
 }
 
 // XrayConfig holds Xray service configuration
@@ -104,6 +107,89 @@ func (s *XrayService) checkXrayHealthWithRetry(ctx context.Context) bool {
 	return false
 }
 
+// reAddStoredUsers re-adds all stored users to Xray after restart.
+// This is needed because Panel sends empty clients[] in config and adds users dynamically.
+// When Xray restarts, these dynamic users are lost and need to be re-added.
+func (s *XrayService) reAddStoredUsers(ctx context.Context) {
+	if s.internal == nil || s.xrayCore == nil || !s.xrayCore.IsRunning() {
+		return
+	}
+
+	storedUsers := s.internal.GetAllStoredUsers()
+	if len(storedUsers) == 0 {
+		return
+	}
+
+	s.logger.Info("Re-adding stored users after Xray restart",
+		zap.Int("userCount", len(storedUsers)))
+
+	successCount := 0
+	failCount := 0
+
+	for _, user := range storedUsers {
+		if user == nil || len(user.Inbounds) == 0 {
+			continue
+		}
+
+		for _, inbound := range user.Inbounds {
+			var err error
+
+			switch inbound.Type {
+			case "trojan":
+				u, createErr := xraycore.CreateTrojanUser(user.Username, user.TrojanPassword, 0)
+				if createErr != nil {
+					err = createErr
+				} else {
+					err = s.xrayCore.AddUser(ctx, inbound.Tag, u)
+				}
+			case "vless":
+				u, createErr := xraycore.CreateVlessUser(user.Username, user.VlessUUID, inbound.Flow, 0)
+				if createErr != nil {
+					err = createErr
+				} else {
+					err = s.xrayCore.AddUser(ctx, inbound.Tag, u)
+				}
+			case "shadowsocks":
+				cipherType := xraycore.CipherTypeFromInt(inbound.CipherType)
+				u, createErr := xraycore.CreateShadowsocksUser(user.Username, user.SSPassword, cipherType, 0)
+				if createErr != nil {
+					err = createErr
+				} else {
+					err = s.xrayCore.AddUser(ctx, inbound.Tag, u)
+				}
+			default:
+				s.logger.Warn("Unknown user type when re-adding",
+					zap.String("username", user.Username),
+					zap.String("type", inbound.Type))
+				continue
+			}
+
+			if err != nil {
+				// "already exists" is OK
+				if strings.Contains(err.Error(), "already exists") {
+					successCount++
+				} else {
+					failCount++
+					s.logger.Warn("Failed to re-add user after restart",
+						zap.String("username", user.Username),
+						zap.String("tag", inbound.Tag),
+						zap.String("type", inbound.Type),
+						zap.Error(err))
+				}
+			} else {
+				successCount++
+				// Re-add to tracking
+				s.internal.AddUserToInbound(inbound.Tag, user.HashUUID)
+			}
+		}
+	}
+
+	s.logger.Info("Completed re-adding stored users",
+		zap.Int("success", successCount),
+		zap.Int("failed", failCount),
+		zap.Int("totalUsers", len(storedUsers)))
+}
+
 // XrayConfigData represents the Xray configuration file structure
 type XrayConfigData struct {
 	Log       interface{}   `json:"log,omitempty"`
@@ -168,7 +254,7 @@ func buildPolicyConfig(config map[string]interface{}) map[string]interface{} {
 			"0": map[string]interface{}{
 				"statsUserUplink":   true,
 				"statsUserDownlink": true,
-				"statsUserOnline":   true,
+				"statsUserOnline":   false,
 			},
 		},
 		"system": map[string]interface{}{
@@ -296,9 +382,27 @@ func (s *XrayService) Start(ctx context.Context, req *StartRequest) (*StartRespo
 		}
 	}
 
-	// Check for concurrent processing
+	// Check for concurrent processing (matches Node.js isXrayStartedProcessing guard)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.isStartProcessing {
+		s.mu.Unlock()
+		s.logger.Warn("Start request already in progress, returning current state")
+		version := s.GetVersion()
+		return &StartResponse{
+			Response: StartResponseData{
+				IsStarted:         s.isXrayOnline,
+				Version:           &version,
+				Error:             nil,
+				SystemInformation: s.getSystemInformation(),
+				NodeInformation:   NodeInformation{Version: nodeVersion},
+			},
+		}, nil
+	}
+	s.isStartProcessing = true
+	defer func() {
+		s.isStartProcessing = false
+		s.mu.Unlock()
+	}()
 
 	// If Xray is online, hashed set check is enabled, and not force restart, check if restart is needed
 	if s.isXrayOnline && !s.disableHashedSetCheck && !req.Internals.ForceRestart && req.Internals.Hashes != nil && s.internal != nil {
@@ -332,25 +436,6 @@ func (s *XrayService) Start(ctx context.Context, req *StartRequest) (*StartRespo
 		s.logger.Warn("Force restart requested")
 	}
 
-	// Check if restart is needed (hash comparison) - for first start
-	if !req.Internals.ForceRestart && !s.isXrayOnline && req.Internals.Hashes != nil && s.internal != nil {
-		needRestart := s.internal.IsNeedRestartCore(req.Internals.Hashes)
-		if !needRestart {
-			s.logger.Info("No changes detected, skipping restart",
-				zap.Duration("checkTime", time.Since(startTime)))
-			version := s.GetVersion()
-			return &StartResponse{
-				Response: StartResponseData{
-					IsStarted:         true,
-					Version:           &version,
-					Error:             nil,
-					SystemInformation: s.getSystemInformation(),
-					NodeInformation:   NodeInformation{Version: nodeVersion},
-				},
-			}, nil
-		}
-	}
-
 	// Generate full config with Stats and Policy
 	fullConfig := generateApiConfig(req.XrayConfig)
 
@@ -380,7 +465,7 @@ func (s *XrayService) Start(ctx context.Context, req *StartRequest) (*StartRespo
 
 	// Extract users from config for tracking (pass hashes to store them)
 	if s.internal != nil {
-		if err := s.internal.ExtractUsersFromConfig(configBytes, req.Internals.Hashes); err != nil {
+		if err := s.internal.ExtractUsersFromConfig(req.Internals.Hashes, configBytes); err != nil {
 			s.logger.Warn("Failed to extract users from config", zap.Error(err))
 		}
 	}
@@ -411,6 +496,11 @@ func (s *XrayService) Start(ctx context.Context, req *StartRequest) (*StartRespo
 	s.logger.Info("Xray started successfully",
 		zap.String("version", version),
 		zap.Duration("elapsed", time.Since(startTime)))
+
+	// Re-add stored users after Xray restart.
+	// This is needed because Panel sends empty clients[] in config and adds users dynamically.
+	// When Xray restarts, these dynamic users are lost and need to be re-added.
+	s.reAddStoredUsers(ctx)
 
 	return successResponse(version), nil
 }
@@ -518,7 +608,7 @@ func (s *XrayService) Restart(ctx context.Context, req *RestartRequest) (*Restar
 
 		// Extract users from config for tracking (pass hashes to store them)
 		if s.internal != nil {
-			if err := s.internal.ExtractUsersFromConfig(configBytes, req.Hashes); err != nil {
+			if err := s.internal.ExtractUsersFromConfig(req.Hashes, configBytes); err != nil {
 				s.logger.Warn("Failed to extract users from config", zap.Error(err))
 			}
 		}
@@ -616,7 +706,7 @@ func (s *XrayService) RestoreStart(ctx context.Context) error {
 		// but at least user mapping will be restored for removal login
 		// Note: passing nil hashes might reset tracking, so be careful.
 		// However, ExtractUsersFromConfig clears existing state anyway.
-		if err := s.internal.ExtractUsersFromConfig(configBytes, nil); err != nil {
+		if err := s.internal.ExtractUsersFromConfig(nil, configBytes); err != nil {
 			s.logger.Warn("Failed to restore users from config", zap.Error(err))
 		}
 	}
