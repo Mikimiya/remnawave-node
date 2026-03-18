@@ -94,6 +94,31 @@ func (s *InternalService) AddXtlsConfigInbound(inboundTag string) {
 	s.xtlsConfigInbounds[inboundTag] = struct{}{}
 }
 
+// TrackUserInbound records that a user is active in an inbound WITHOUT updating
+// the inboundsHashMap (DJB2 hash). Used by reAddStoredUsers so that re-adding
+// dynamic users after a restart does not change the per-inbound hash, which would
+// cause IsNeedRestartCore to always return true and trigger an infinite restart loop.
+//
+// The xtlsConfigInbounds entry is written so RemoveUser can still locate the inbound.
+// userInboundMap is updated so GetUsersInInbound / GetUsersCountInInbound work correctly.
+func (s *InternalService) TrackUserInbound(inboundTag, user string) {
+
+	// Register the inbound tag so RemoveUser can enumerate it
+	s.xtlsConfigInbounds[inboundTag] = struct{}{}
+
+	// Keep userInboundMap in sync for GetUsersInInbound / GetUsersCountInInbound
+	if s.userInboundMap[user] == nil {
+		s.userInboundMap[user] = make(map[string]struct{})
+	}
+	s.userInboundMap[user][inboundTag] = struct{}{}
+
+	// NOTE: intentionally NOT touching inboundsHashMap here.
+	// Panel sends hashes computed against empty inbounds (clients=[]).
+	// If we XOR user UUIDs into inboundsHashMap here, the stored hash
+	// diverges from what Panel expects, and IsNeedRestartCore would
+	// trigger a restart on every /start call, creating an infinite loop.
+}
+
 // Cleanup clears internal state (called when Xray stops)
 // Matches Node.js: cleanup()
 // NOTE: storedUsers is NOT cleared here - it's needed to re-add users after restart.
@@ -199,27 +224,29 @@ func (s *InternalService) AddUserToInbound(inboundTag, user string) {
 
 // RemoveUserFromInbound removes a user from an inbound tracking.
 // Also removes the user from the InboundHashedSet so the DJB2 hash stays in sync.
-// When the inbound has no remaining users, also cleans up xtlsConfigInbounds and
-// inboundsHashMap (matches Node.js behavior where both inboundsHashMap and
-// xtlsConfigInbounds are cleared when usersSet.size === 0).
+// When the inbound has no remaining users, also cleans up inboundsHashMap
+// (matches Node.js behavior where inboundsHashMap is cleared when usersSet.size === 0).
 // Matches Node.js: removeUserFromInbound(inboundTag, user)
 func (s *InternalService) RemoveUserFromInbound(inboundTag, user string) {
 
-	// Update the InboundHashedSet — matches Node.js: usersSet.delete(user)
-	hs, exists := s.inboundsHashMap[inboundTag]
-	if !exists {
-		// Matches Node.js: if (!usersSet) return;
-		return
-	}
-	hs.Delete(user)
-
-	// Also update userInboundMap for internal tracking
+	// Always clean up userInboundMap regardless of whether inboundsHashMap has this tag.
+	// This handles users that were tracked via TrackUserInbound (reAddStoredUsers path)
+	// which only writes xtlsConfigInbounds/userInboundMap but not inboundsHashMap.
 	if tags, exists := s.userInboundMap[user]; exists {
 		delete(tags, inboundTag)
 		if len(tags) == 0 {
 			delete(s.userInboundMap, user)
 		}
 	}
+
+	// Update the InboundHashedSet — matches Node.js: usersSet.delete(user)
+	hs, exists := s.inboundsHashMap[inboundTag]
+	if !exists {
+		// Matches Node.js: if (!usersSet) return;
+		// No hash entry — nothing more to do (user was tracked via TrackUserInbound).
+		return
+	}
+	hs.Delete(user)
 
 	// Check if the inbound now has zero users using InboundHashedSet.Size()
 	// This matches Node.js: if (usersSet.size === 0) { ... }

@@ -165,9 +165,10 @@ func (s *XrayService) reAddStoredUsers(ctx context.Context) {
 			}
 
 			if err != nil {
-				// "already exists" is OK
+				// "already exists" is OK — user IS in xray-core, update tracking too
 				if strings.Contains(err.Error(), "already exists") {
 					successCount++
+					s.internal.TrackUserInbound(inbound.Tag, user.HashUUID)
 				} else {
 					failCount++
 					s.logger.Warn("Failed to re-add user after restart",
@@ -178,8 +179,11 @@ func (s *XrayService) reAddStoredUsers(ctx context.Context) {
 				}
 			} else {
 				successCount++
-				// Re-add to tracking
-				s.internal.AddUserToInbound(inbound.Tag, user.HashUUID)
+				// Track user in xtlsConfigInbounds and userInboundMap WITHOUT
+				// modifying inboundsHashMap (hash). Panel hashes are computed
+				// against empty inbounds; touching the hash here would cause
+				// IsNeedRestartCore to always return true → infinite restart loop.
+				s.internal.TrackUserInbound(inbound.Tag, user.HashUUID)
 			}
 		}
 	}
@@ -732,6 +736,9 @@ func (s *XrayService) RestoreStart(ctx context.Context) error {
 
 	s.logger.Info("Xray restored successfully from local config",
 		zap.String("version", version))
+
+	// Re-add stored users (same as Start/Restart paths)
+	s.reAddStoredUsers(ctx)
 
 	return nil
 }
