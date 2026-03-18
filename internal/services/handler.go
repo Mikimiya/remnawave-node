@@ -321,9 +321,10 @@ func cipherTypeToMethod(ct CipherType) string {
 
 // InboundData represents inbound configuration for a user (Node.js format)
 type InboundData struct {
-	Type string `json:"type"` // "trojan", "vless", "shadowsocks"
-	Tag  string `json:"tag"`
-	Flow string `json:"flow,omitempty"` // For vless
+	Type       string `json:"type"` // "trojan", "vless", "shadowsocks"
+	Tag        string `json:"tag"`
+	Flow       string `json:"flow,omitempty"`       // For vless
+	CipherType int    `json:"cipherType,omitempty"` // For shadowsocks
 }
 
 // UserDataForBatch represents user data in batch request (Node.js format)
@@ -449,11 +450,15 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 					err = s.xrayCore.AddUser(ctx, item.Tag, u)
 				}
 			case "shadowsocks":
-				cipherType := xraycore.CipherTypeFromInt(7) // chacha20-poly1305 default
+				ct := item.CipherType
+				if ct == 0 {
+					ct = 7 // fallback to chacha20-poly1305
+				}
+				cipherType := xraycore.CipherTypeFromInt(ct)
 				s.logger.Info("Creating shadowsocks user",
 					zap.String("userId", user.UserData.UserId),
 					zap.String("tag", item.Tag),
-					zap.Int("cipherType", 7))
+					zap.Int("cipherType", ct))
 				u, createErr := xraycore.CreateShadowsocksUser(user.UserData.UserId, user.UserData.SsPassword, cipherType, 0)
 				if createErr != nil {
 					s.logger.Error("Failed to create shadowsocks user", zap.Error(createErr))
@@ -512,7 +517,11 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 				Flow: item.Flow,
 			}
 			if item.Type == "shadowsocks" {
-				inbound.CipherType = 7 // chacha20-poly1305 default
+				if item.CipherType != 0 {
+					inbound.CipherType = item.CipherType
+				} else {
+					inbound.CipherType = 7 // fallback chacha20-poly1305
+				}
 			}
 			storedUser.Inbounds = append(storedUser.Inbounds, inbound)
 		}

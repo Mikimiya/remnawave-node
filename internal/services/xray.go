@@ -647,6 +647,9 @@ func (s *XrayService) Restart(ctx context.Context, req *RestartRequest) (*Restar
 		zap.String("version", version),
 		zap.Duration("elapsed", time.Since(startTime)))
 
+	// Re-add stored users after restart (same as Start())
+	s.reAddStoredUsers(ctx)
+
 	return &RestartResponse{
 		Success: true,
 		Message: "Xray restarted successfully",

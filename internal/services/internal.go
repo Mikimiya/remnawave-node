@@ -224,9 +224,13 @@ func (s *InternalService) RemoveUserFromInbound(inboundTag, user string) {
 	// Check if the inbound now has zero users using InboundHashedSet.Size()
 	// This matches Node.js: if (usersSet.size === 0) { ... }
 	if hs.Size() == 0 {
-		delete(s.xtlsConfigInbounds, inboundTag)
+		// NOTE: We intentionally do NOT delete from xtlsConfigInbounds here.
+		// Deleting the tag causes a critical bug: if Panel calls RemoveUser after
+		// the last user is removed, allTags would be empty and the user would
+		// remain in xray-core without being cleaned up.
+		// We only clear inboundsHashMap (hash tracking), not the inbound registry.
 		delete(s.inboundsHashMap, inboundTag)
-		s.logger.Warn("Inbound has no users, clearing inboundsHashMap.",
+		s.logger.Debug("Inbound has no users, cleared hash tracking (inbound kept in registry).",
 			zap.String("tag", inboundTag))
 	}
 }
