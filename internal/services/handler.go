@@ -552,9 +552,16 @@ func (s *HandlerService) RemoveUser(ctx context.Context, req *RemoveUserRequest)
 		return &RemoveUserResponse{Success: false, Error: &errMsg}, nil
 	}
 
+	// Always remove from storedUsers regardless of known inbounds state
+	s.internal.RemoveStoredUser(req.Username)
+
 	// Get all known inbounds
 	allTags := s.internal.GetXtlsConfigInbounds()
 	if len(allTags) == 0 {
+		// No known inbounds yet (e.g. node just restarted before /start was called).
+		// User is already removed from storedUsers so won't be re-added on restart.
+		s.logger.Info("RemoveUser: no known inbounds, user removed from stored users only",
+			zap.String("username", req.Username))
 		return &RemoveUserResponse{Success: true, Error: nil}, nil
 	}
 
@@ -586,9 +593,6 @@ func (s *HandlerService) RemoveUser(ctx context.Context, req *RemoveUserRequest)
 		zap.String("username", req.Username),
 		zap.Int("success", successCount),
 		zap.Int("failed", failCount))
-
-	// Also remove from stored users so they don't get re-added on restart
-	s.internal.RemoveStoredUser(req.Username)
 
 	// If ALL operations failed, return error (matches Node.js behavior)
 	if successCount == 0 && failCount > 0 {
@@ -630,9 +634,17 @@ func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersReques
 		return &RemoveUsersResponse{Success: false, Error: &errMsg}, nil
 	}
 
+	// Always remove from storedUsers regardless of known inbounds state
+	for _, user := range req.Users {
+		s.internal.RemoveStoredUser(user.UserId)
+	}
+
 	// Get all known inbounds
 	allTags := s.internal.GetXtlsConfigInbounds()
 	if len(allTags) == 0 {
+		// No known inbounds yet, users removed from storedUsers so won't be re-added on restart.
+		s.logger.Info("RemoveUsers: no known inbounds, users removed from stored users only",
+			zap.Int("users", len(req.Users)))
 		return &RemoveUsersResponse{Success: true, Error: nil}, nil
 	}
 
@@ -664,9 +676,6 @@ func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersReques
 			}
 			s.internal.RemoveUserFromInbound(tag, user.HashUuid)
 		}
-
-		// Also remove from stored users so they don't get re-added on restart
-		s.internal.RemoveStoredUser(user.UserId)
 	}
 
 	s.logger.Info("Batch remove users completed",
