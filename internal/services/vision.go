@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -16,13 +17,16 @@ import (
 // VisionService manages IP blocking via Xray router rules.
 //
 // Concurrency: uses the same global RWMutex shared across all services.
-// BlockIP / UnblockIP / ClearBlockedIPs acquire a WRITE lock (mutations).
-// GetBlockedIPs acquires a READ lock.
+// BlockIP / UnblockIP acquire a WRITE lock (mutations).
+//
+// Design note: No local IP tracking map. After any xray restart routing rules
+// are wiped, so a local cache would become stale. Instead, every call goes
+// directly through to xray — matching Node.js which always calls gRPC directly.
+// "already exists" / "not found" errors from xray are treated as success.
 type VisionService struct {
-	logger     *zap.Logger
-	xrayCore   *xraycore.Instance
-	blockedIPs map[string]string // IP -> ruleTag (MD5 hash)
-	blockTag   string
+	logger   *zap.Logger
+	xrayCore *xraycore.Instance
+	blockTag string
 
 	// Global RWMutex shared across all services.
 	mu *sync.RWMutex
@@ -40,11 +44,10 @@ func NewVisionService(cfg *VisionConfig, xrayCore *xraycore.Instance, mu *sync.R
 		blockTag = "BLOCK"
 	}
 	return &VisionService{
-		logger:     logger,
-		xrayCore:   xrayCore,
-		blockedIPs: make(map[string]string),
-		blockTag:   blockTag,
-		mu:         mu,
+		logger:   logger,
+		xrayCore: xrayCore,
+		blockTag: blockTag,
+		mu:       mu,
 	}
 }
 
@@ -74,35 +77,36 @@ type BlockIPResponse struct {
 	Error   *string `json:"error"`
 }
 
-// BlockIP blocks an IP address
+// BlockIP blocks an IP address by adding a routing rule to xray.
+// Always calls through to xray directly — no local cache.
+// If xray is not running, returns success (rule will be absent, but so is xray).
 func (s *VisionService) BlockIP(ctx context.Context, req *BlockIPRequest) (*BlockIPResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if already blocked
-	if _, exists := s.blockedIPs[req.IP]; exists {
-		return &BlockIPResponse{
-			Success: true,
-			Error:   nil,
-		}, nil
+	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
+		s.logger.Warn("BlockIP: xray not running, skipping",
+			zap.String("ip", req.IP))
+		return &BlockIPResponse{Success: true, Error: nil}, nil
 	}
 
-	// Generate rule tag from IP hash
 	ruleTag := s.getIPHash(req.IP)
 
-	// Add rule via embedded Xray router
-	if s.xrayCore != nil && s.xrayCore.IsRunning() {
-		if err := s.xrayCore.AddRoutingRule(ctx, ruleTag, req.IP, s.blockTag); err != nil {
-			s.logger.Error("Failed to add block rule",
-				zap.String("ip", req.IP),
-				zap.String("ruleTag", ruleTag),
-				zap.Error(err))
-			errMsg := err.Error()
-			return &BlockIPResponse{Success: false, Error: &errMsg}, nil
+	if err := s.xrayCore.AddRoutingRule(ctx, ruleTag, req.IP, s.blockTag); err != nil {
+		// "already exists" means rule is already in xray — treat as success
+		if strings.Contains(err.Error(), "already exists") {
+			s.logger.Debug("BlockIP: rule already exists in xray",
+				zap.String("ip", req.IP))
+			return &BlockIPResponse{Success: true, Error: nil}, nil
 		}
+		s.logger.Error("Failed to add block rule",
+			zap.String("ip", req.IP),
+			zap.String("ruleTag", ruleTag),
+			zap.Error(err))
+		errMsg := err.Error()
+		return &BlockIPResponse{Success: false, Error: &errMsg}, nil
 	}
 
-	s.blockedIPs[req.IP] = ruleTag
 	s.logger.Info("Blocked IP",
 		zap.String("ip", req.IP),
 		zap.String("ruleTag", ruleTag))
@@ -110,7 +114,6 @@ func (s *VisionService) BlockIP(ctx context.Context, req *BlockIPRequest) (*Bloc
 	return &BlockIPResponse{Success: true, Error: nil}, nil
 }
 
-// UnblockIPRequest represents a request to unblock an IP
 // UnblockIPRequest represents a request to unblock an IP (Node.js format)
 type UnblockIPRequest struct {
 	IP       string `json:"ip"`
@@ -124,76 +127,39 @@ type UnblockIPResponse struct {
 	Error   *string `json:"error"`
 }
 
-// UnblockIP unblocks an IP address
+// UnblockIP unblocks an IP address by removing its routing rule from xray.
+// Always calls through to xray directly — no local cache.
+// If xray is not running, returns success.
 func (s *VisionService) UnblockIP(ctx context.Context, req *UnblockIPRequest) (*UnblockIPResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if not blocked
-	ruleTag, exists := s.blockedIPs[req.IP]
-	if !exists {
-		return &UnblockIPResponse{
-			Success: true,
-			Error:   nil,
-		}, nil
+	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
+		s.logger.Warn("UnblockIP: xray not running, skipping",
+			zap.String("ip", req.IP))
+		return &UnblockIPResponse{Success: true, Error: nil}, nil
 	}
 
-	// Remove rule via embedded Xray router
-	if s.xrayCore != nil && s.xrayCore.IsRunning() {
-		if err := s.xrayCore.RemoveRoutingRule(ctx, ruleTag); err != nil {
-			s.logger.Error("Failed to remove block rule",
-				zap.String("ip", req.IP),
-				zap.String("ruleTag", ruleTag),
-				zap.Error(err))
-			errMsg := err.Error()
-			return &UnblockIPResponse{Success: false, Error: &errMsg}, nil
+	ruleTag := s.getIPHash(req.IP)
+
+	if err := s.xrayCore.RemoveRoutingRule(ctx, ruleTag); err != nil {
+		// "not found" means rule is already absent in xray — treat as success
+		if strings.Contains(err.Error(), "not found") {
+			s.logger.Debug("UnblockIP: rule not found in xray (already removed)",
+				zap.String("ip", req.IP))
+			return &UnblockIPResponse{Success: true, Error: nil}, nil
 		}
+		s.logger.Error("Failed to remove block rule",
+			zap.String("ip", req.IP),
+			zap.String("ruleTag", ruleTag),
+			zap.Error(err))
+		errMsg := err.Error()
+		return &UnblockIPResponse{Success: false, Error: &errMsg}, nil
 	}
 
-	delete(s.blockedIPs, req.IP)
 	s.logger.Info("Unblocked IP",
 		zap.String("ip", req.IP),
 		zap.String("ruleTag", ruleTag))
 
 	return &UnblockIPResponse{Success: true, Error: nil}, nil
-}
-
-// GetBlockedIPsResponse represents the list of blocked IPs
-type GetBlockedIPsResponse struct {
-	IPs []string `json:"ips"`
-}
-
-// GetBlockedIPs returns all blocked IPs
-func (s *VisionService) GetBlockedIPs() *GetBlockedIPsResponse {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ips := make([]string, 0, len(s.blockedIPs))
-	for ip := range s.blockedIPs {
-		ips = append(ips, ip)
-	}
-
-	return &GetBlockedIPsResponse{IPs: ips}
-}
-
-// ClearBlockedIPs clears all blocked IPs
-func (s *VisionService) ClearBlockedIPs(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for ip, ruleTag := range s.blockedIPs {
-		if s.xrayCore != nil && s.xrayCore.IsRunning() {
-			if err := s.xrayCore.RemoveRoutingRule(ctx, ruleTag); err != nil {
-				s.logger.Warn("Failed to remove block rule during clear",
-					zap.String("ip", ip),
-					zap.String("ruleTag", ruleTag),
-					zap.Error(err))
-			}
-		}
-	}
-
-	s.blockedIPs = make(map[string]string)
-	s.logger.Info("Cleared all blocked IPs")
-
-	return nil
 }

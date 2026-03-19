@@ -259,35 +259,6 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 
 	// Return success if at least one user was added
 	if successCount > 0 {
-		// Store user credentials for re-adding after Xray restart
-		storedUser := &StoredUser{
-			Username:  username,
-			HashUUID:  req.HashData.VlessUUID,
-			VlessUUID: "", // will be set per-inbound below
-		}
-
-		// Build inbound list from successful adds
-		for _, item := range req.Data {
-			inbound := StoredUserInboundData{
-				Tag:        item.Tag,
-				Type:       item.Type,
-				Flow:       item.Flow,
-				CipherType: int(item.CipherType),
-			}
-			storedUser.Inbounds = append(storedUser.Inbounds, inbound)
-
-			// Extract credentials based on type
-			switch item.Type {
-			case "vless":
-				storedUser.VlessUUID = item.UUID
-			case "trojan":
-				storedUser.TrojanPassword = item.Password
-			case "shadowsocks":
-				storedUser.SSPassword = item.Password
-			}
-		}
-
-		s.internal.StoreUser(storedUser)
 		return &AddUserResponse{Success: true, Error: nil}, nil
 	}
 
@@ -299,24 +270,6 @@ func (s *HandlerService) AddUser(ctx context.Context, req *AddUserRequest) (*Add
 
 	errMsg := "no users were added"
 	return &AddUserResponse{Success: false, Error: &errMsg}, nil
-}
-
-// cipherTypeToMethod converts CipherType enum to method string
-func cipherTypeToMethod(ct CipherType) string {
-	switch ct {
-	case CipherTypeAES128GCM:
-		return "aes-128-gcm"
-	case CipherTypeAES256GCM:
-		return "aes-256-gcm"
-	case CipherTypeCHACHA20POLY1305:
-		return "chacha20-poly1305"
-	case CipherTypeXCHACHA20POLY1305:
-		return "xchacha20-poly1305"
-	case CipherTypeNone:
-		return "none"
-	default:
-		return "aes-256-gcm"
-	}
 }
 
 // InboundData represents inbound configuration for a user (Node.js format)
@@ -502,30 +455,6 @@ func (s *HandlerService) AddUsers(ctx context.Context, req *AddUsersRequest) (*A
 			}
 		}
 
-		// Store user credentials for re-adding after Xray restart
-		storedUser := &StoredUser{
-			Username:       user.UserData.UserId,
-			HashUUID:       user.UserData.HashUuid,
-			VlessUUID:      user.UserData.VlessUuid,
-			TrojanPassword: user.UserData.TrojanPassword,
-			SSPassword:     user.UserData.SsPassword,
-		}
-		for _, item := range user.InboundData {
-			inbound := StoredUserInboundData{
-				Tag:  item.Tag,
-				Type: item.Type,
-				Flow: item.Flow,
-			}
-			if item.Type == "shadowsocks" {
-				if item.CipherType != 0 {
-					inbound.CipherType = item.CipherType
-				} else {
-					inbound.CipherType = 7 // fallback chacha20-poly1305
-				}
-			}
-			storedUser.Inbounds = append(storedUser.Inbounds, inbound)
-		}
-		s.internal.StoreUser(storedUser)
 	}
 
 	s.logger.Info("Batch add users completed", zap.Int("users", len(req.Users)))
@@ -557,19 +486,16 @@ func (s *HandlerService) RemoveUser(ctx context.Context, req *RemoveUserRequest)
 	defer s.mu.Unlock()
 
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
-		errMsg := "Xray not running"
-		return &RemoveUserResponse{Success: false, Error: &errMsg}, nil
+		// Xray is restarting or stopped. Panel sync will re-push active users on recovery.
+		s.logger.Info("RemoveUser: xray not running, skipping",
+			zap.String("username", req.Username))
+		return &RemoveUserResponse{Success: true, Error: nil}, nil
 	}
-
-	// Always remove from storedUsers regardless of known inbounds state
-	s.internal.RemoveStoredUser(req.Username)
 
 	// Get all known inbounds
 	allTags := s.internal.GetXtlsConfigInbounds()
 	if len(allTags) == 0 {
-		// No known inbounds yet (e.g. node just restarted before /start was called).
-		// User is already removed from storedUsers so won't be re-added on restart.
-		s.logger.Info("RemoveUser: no known inbounds, user removed from stored users only",
+		s.logger.Info("RemoveUser: no known inbounds",
 			zap.String("username", req.Username))
 		return &RemoveUserResponse{Success: true, Error: nil}, nil
 	}
@@ -639,20 +565,15 @@ func (s *HandlerService) RemoveUsers(ctx context.Context, req *RemoveUsersReques
 	defer s.mu.Unlock()
 
 	if s.xrayCore == nil || !s.xrayCore.IsRunning() {
-		errMsg := "Xray not running"
-		return &RemoveUsersResponse{Success: false, Error: &errMsg}, nil
-	}
-
-	// Always remove from storedUsers regardless of known inbounds state
-	for _, user := range req.Users {
-		s.internal.RemoveStoredUser(user.UserId)
+		s.logger.Info("RemoveUsers: xray not running, skipping",
+			zap.Int("users", len(req.Users)))
+		return &RemoveUsersResponse{Success: true, Error: nil}, nil
 	}
 
 	// Get all known inbounds
 	allTags := s.internal.GetXtlsConfigInbounds()
 	if len(allTags) == 0 {
-		// No known inbounds yet, users removed from storedUsers so won't be re-added on restart.
-		s.logger.Info("RemoveUsers: no known inbounds, users removed from stored users only",
+		s.logger.Info("RemoveUsers: no known inbounds",
 			zap.Int("users", len(req.Users)))
 		return &RemoveUsersResponse{Success: true, Error: nil}, nil
 	}

@@ -28,6 +28,13 @@ const (
 
 // setupRoutes configures all API routes
 func (s *Server) setupRoutes() {
+	// Root-level routes (no /node prefix, no JWT) — matches Node.js routes served on
+	// 127.0.0.1:61001 with PortGuard. In the Go version there is no separate port;
+	// mTLS on the main server provides equivalent authentication.
+	s.router.POST("/vision/block-ip", s.handleBlockIP)
+	s.router.POST("/vision/unblock-ip", s.handleUnblockIP)
+	s.router.GET("/internal/get-config", s.handleRawGetConfig)
+
 	// Apply JWT auth middleware to main router
 	authMiddleware := middleware.JWTAuth(s.cfg.NodePayload.JWTPublicKey, s.log)
 
@@ -470,4 +477,16 @@ func (s *Server) handleUnblockIP(c *gin.Context) {
 func (s *Server) handleGetConfig(c *gin.Context) {
 	resp := s.internalService.GetConfig()
 	c.JSON(http.StatusOK, resp)
+}
+
+// handleRawGetConfig returns the raw xray config JSON without any wrapper.
+// Matches Node.js InternalController on port 61001: returns Record<string, unknown> directly.
+// Served at GET /internal/get-config (no /node prefix, no JWT).
+func (s *Server) handleRawGetConfig(c *gin.Context) {
+	cfg := s.internalService.GetConfig()
+	if cfg.Config == nil {
+		c.JSON(http.StatusOK, gin.H{})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", cfg.Config)
 }

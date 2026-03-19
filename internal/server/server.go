@@ -60,7 +60,7 @@ func New(cfg *config.Config, log *logger.Logger) (*Server, error) {
 	// Single global mutex shared across ALL services.
 	// This replicates Node.js single-threaded semantics:
 	//   - Write lock for mutations (start/stop/restart, addUser/removeUser, blockIP)
-	//   - Read lock for queries (getStats, healthcheck, getInboundUsers, getBlockedIPs)
+	//   - Read lock for queries (getStats, healthcheck, getInboundUsers)
 	mu := &sync.RWMutex{}
 
 	xrayService := services.NewXrayService(&services.XrayConfig{
@@ -102,7 +102,7 @@ func New(cfg *config.Config, log *logger.Logger) (*Server, error) {
 	return srv, nil
 }
 
-// Start starts the main HTTP server with mTLS
+// Start starts the main mTLS server.
 func (s *Server) Start() error {
 	return s.startMainServer()
 }

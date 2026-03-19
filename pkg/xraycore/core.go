@@ -278,20 +278,26 @@ type SystemStats struct {
 	Uptime       uint32 `json:"uptime"`
 }
 
-// GetUserOnlineStatus checks if a user is online (has active connections)
+// GetUserOnlineStatus checks if a user has an active connection.
+// Matches Node.js: calls xtlsSdk.stats.getUserOnlineStatus which queries the
+// "user>>>email>>>online" counter. With statsUserOnline=false in policy this
+// counter is never created, so returns false — same as Node.js behavior.
 func (x *Instance) GetUserOnlineStatus(ctx context.Context, email string) (bool, error) {
-	allStats, err := x.GetStats(ctx, fmt.Sprintf("user>>>%s>>>", email), false)
-	if err != nil {
-		return false, err
+	if x.instance == nil {
+		return false, fmt.Errorf("Xray instance not running")
 	}
 
-	// User is online if there's any traffic
-	for _, value := range allStats {
-		if value > 0 {
-			return true, nil
-		}
+	statsFeature := x.instance.GetFeature(stats.ManagerType())
+	if statsFeature == nil {
+		return false, fmt.Errorf("stats feature not found")
 	}
-	return false, nil
+
+	manager := statsFeature.(stats.Manager)
+	counter := manager.GetCounter(fmt.Sprintf("user>>>%s>>>online", email))
+	if counter == nil {
+		return false, nil
+	}
+	return counter.Value() > 0, nil
 }
 
 // ============= Router Service (IP Blocking) =============
@@ -330,7 +336,8 @@ func (x *Instance) AddRoutingRule(ctx context.Context, ruleTag string, targetIP 
 	}
 
 	ruleMsg := cserial.ToTypedMessage(rule)
-	return r.AddRule(ruleMsg, false)
+	// append=true matches Node.js xtlsApi.router.addSrcIpRule({ append: true })
+	return r.AddRule(ruleMsg, true)
 }
 
 // parseCIDR parses an IP or CIDR string into a CIDR proto message
